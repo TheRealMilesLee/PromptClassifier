@@ -1,0 +1,2 @@
+# Linux/Windows CPU or CUDA training/runtime
+tensorflow==2.16.2

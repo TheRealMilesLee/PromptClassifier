@@ -1,0 +1,6 @@
+# Optional dependency for bounded Hugging Face streaming downloads.
+# Python 3.14 needs the newer datasets line; the 3.x line can fail while
+# fingerprinting parquet data because its dill/pickle integration predates
+# Python 3.14.  The public sources used here are parquet-backed and do not
+# depend on a dataset loading script.
+datasets>=4,<6

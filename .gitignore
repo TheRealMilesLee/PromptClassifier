@@ -1,0 +1,33 @@
+# Python build/test/runtime noise.
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# Local virtual environments and IDE/editor state.
+.venv/
+.venv-*/
+venv/
+env/
+.mypy_cache/
+.ruff_cache/
+.DS_Store
+.idea/
+.vscode/
+
+# Local datasets, preprocessing outputs, and model artifacts can be many GB.
+# Keep small checked-in fixtures such as data/examples.jsonl and data/README.md.
+data/raw/
+data/processed/
+data/public/
+artifacts/
+
+# Local Hugging Face/cache/runtime state.
+.cache/
+.hf/
+*.log

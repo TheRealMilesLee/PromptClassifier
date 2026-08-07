@@ -1,0 +1,48 @@
+{"text":"请写一封礼貌的邮件，向客户说明交付会延期两天。","work_type":"text","intent":"create","complexity":"low","effort":"S"}
+{"text":"把下面这段英文翻译成自然的中文。","work_type":"text","intent":"translate","complexity":"low","effort":"XS"}
+{"text":"请总结这篇文章，提炼出三个核心观点。","work_type":"text","intent":"summarize","complexity":"low","effort":"S"}
+{"text":"帮我润色这份简历，让表达更专业。","work_type":"text","intent":"modify","complexity":"low","effort":"S"}
+{"text":"根据这些会议记录提取行动项，并整理成表格。","work_type":"text","intent":"extract","complexity":"medium","effort":"M"}
+{"text":"把这段产品介绍改写成适合社交媒体发布的短文案。","work_type":"text","intent":"modify","complexity":"low","effort":"S"}
+{"text":"写一份关于本季度项目进展的正式报告。","work_type":"text","intent":"create","complexity":"medium","effort":"M"}
+{"text":"Please rewrite this paragraph in a concise and professional tone.","work_type":"text","intent":"modify","complexity":"low","effort":"S"}
+{"text":"实现一个 Python 函数，把 CSV 文件转换成 JSON。","work_type":"code","intent":"create","complexity":"low","effort":"S"}
+{"text":"修复这个 API 在输入为空时抛出的异常，并补一个测试。","work_type":"code","intent":"debug","complexity":"medium","effort":"M"}
+{"text":"重构这个模块，降低重复代码，同时保持现有接口不变。","work_type":"code","intent":"modify","complexity":"medium","effort":"M"}
+{"text":"请为这个 JavaScript 项目补充单元测试和 CI 配置。","work_type":"code","intent":"create","complexity":"high","effort":"L"}
+{"text":"解释这段递归代码的执行过程，最好给一个简单例子。","work_type":"code","intent":"explain","complexity":"low","effort":"S"}
+{"text":"Review this pull request and point out correctness and maintainability risks.","work_type":"code","intent":"review","complexity":"medium","effort":"M"}
+{"text":"开发一个带鉴权、数据库和分页功能的 REST API。","work_type":"code","intent":"create","complexity":"high","effort":"XL"}
+{"text":"优化这条 SQL 查询，分析慢查询的原因并给出修改后的版本。","work_type":"code","intent":"debug","complexity":"medium","effort":"M"}
+{"text":"比较 PostgreSQL 和 MySQL 在这个业务场景下的优缺点。","work_type":"analysis","intent":"analyze","complexity":"medium","effort":"M"}
+{"text":"为什么这个方案会导致数据一致性问题？请解释底层原理。","work_type":"analysis","intent":"explain","complexity":"medium","effort":"S"}
+{"text":"评估这两个架构方案的风险、成本和长期可维护性。","work_type":"analysis","intent":"review","complexity":"high","effort":"L"}
+{"text":"总结这份研究报告，并列出对我们最有价值的结论。","work_type":"analysis","intent":"summarize","complexity":"medium","effort":"M"}
+{"text":"从这批用户反馈中分析主要趋势和高频问题。","work_type":"analysis","intent":"analyze","complexity":"medium","effort":"M"}
+{"text":"帮我判断这些反馈应该归入哪些产品类别。","work_type":"analysis","intent":"classify","complexity":"medium","effort":"M"}
+{"text":"Explain the trade-offs between caching and strongly consistent reads.","work_type":"analysis","intent":"explain","complexity":"medium","effort":"S"}
+{"text":"检查这份技术方案是否遗漏了关键风险和依赖。","work_type":"analysis","intent":"review","complexity":"medium","effort":"M"}
+{"text":"排查线上 DNS 查询超时，找出原因并给出恢复步骤。","work_type":"operations","intent":"debug","complexity":"high","effort":"L"}
+{"text":"把这个服务部署到 Kubernetes 集群，并配置生产环境的健康检查。","work_type":"operations","intent":"create","complexity":"high","effort":"L"}
+{"text":"为生产服务设计监控指标、告警规则和 Grafana 仪表盘。","work_type":"operations","intent":"create","complexity":"high","effort":"XL"}
+{"text":"分析这段 Nginx 日志，解释请求大量 502 的原因。","work_type":"operations","intent":"debug","complexity":"medium","effort":"M"}
+{"text":"调整 Kubernetes 的 autoscaling 配置，降低高峰期的资源浪费。","work_type":"operations","intent":"modify","complexity":"high","effort":"L"}
+{"text":"恢复 Kafka 消费延迟，检查 broker、网络和消费者配置。","work_type":"operations","intent":"debug","complexity":"high","effort":"L"}
+{"text":"为域名证书过期建立自动检查和提前告警。","work_type":"operations","intent":"create","complexity":"medium","effort":"M"}
+{"text":"请解释这台服务器的磁盘告警应该如何处理。","work_type":"operations","intent":"explain","complexity":"low","effort":"S"}
+{"text":"规划一次从盐湖城出发、经过黄石和冰川国家公园的自驾路线。","work_type":"planning","intent":"plan","complexity":"high","effort":"L"}
+{"text":"把这个大项目拆解成里程碑、任务和验收标准。","work_type":"planning","intent":"plan","complexity":"high","effort":"L"}
+{"text":"制定一个三个月的 Kubernetes 学习计划，每周安排具体练习。","work_type":"planning","intent":"plan","complexity":"medium","effort":"M"}
+{"text":"为数据库迁移制定完整方案，包括回滚、演练和上线排期。","work_type":"planning","intent":"plan","complexity":"high","effort":"XL"}
+{"text":"根据团队资源给下季度 backlog 排优先级。","work_type":"planning","intent":"analyze","complexity":"medium","effort":"M"}
+{"text":"设计一个从需求评审到发布的研发流程和检查清单。","work_type":"planning","intent":"create","complexity":"medium","effort":"M"}
+{"text":"给我安排一条北京周末摄影路线，要求交通方便且光线好。","work_type":"planning","intent":"plan","complexity":"low","effort":"S"}
+{"text":"Create a roadmap for migrating the service to AWS with phased milestones.","work_type":"planning","intent":"plan","complexity":"high","effort":"XL"}
+{"text":"从零设计并实现一个服务，包括代码、部署、监控和文档。","work_type":"mixed","intent":"create","complexity":"high","effort":"XL"}
+{"text":"分析线上日志，修复代码问题，并给出发布验证方案。","work_type":"mixed","intent":"debug","complexity":"high","effort":"XL"}
+{"text":"重构这个服务，同时更新单元测试、接口文档和部署配置。","work_type":"mixed","intent":"modify","complexity":"high","effort":"XL"}
+{"text":"评估现有架构，写出技术决策报告，并列出迁移步骤。","work_type":"mixed","intent":"review","complexity":"high","effort":"XL"}
+{"text":"创建监控仪表盘和告警规则，并把它们部署到生产环境。","work_type":"mixed","intent":"create","complexity":"high","effort":"XL"}
+{"text":"请把这段代码翻译成 Go，并解释关键设计取舍。","work_type":"mixed","intent":"modify","complexity":"medium","effort":"L"}
+{"text":"分析用户需求后，给出产品方案、接口设计和开发拆解。","work_type":"mixed","intent":"plan","complexity":"high","effort":"XL"}
+{"text":"把这份英文技术文档总结成中文，并提取配置注意事项。","work_type":"mixed","intent":"summarize","complexity":"medium","effort":"M"}

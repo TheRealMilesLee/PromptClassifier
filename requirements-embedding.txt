@@ -1,0 +1,4 @@
+# Optional semantic encoder for the Task IR tagger.
+# The dependency pulls a PyTorch runtime; the tagger API is backend-agnostic
+# and the offline hash backend remains available for tests and smoke runs.
+sentence-transformers>=3.0,<6
