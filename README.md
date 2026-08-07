@@ -6,6 +6,19 @@ TrendModel 是给 Auto Router 使用的轻量级 prompt 标签模型。它只负
 
 它不负责生成最终答案，也不负责选择具体模型或执行工具。下游 router 消费这里产生的 Task IR，再根据质量、成本、上下文长度和权限选择模型。
 
+## 给下游项目的集成入口
+
+如果你要在另一个项目中引用最终 TensorFlow 模型，请先阅读
+[下游集成手册](docs/INTEGRATION.md)。它包含：
+
+- Python 直接加载 `model.keras` 的方式；
+- OpenAI-compatible `/v1/chat/completions` 的启动和请求格式；
+- 完整 JSON 字段、label、probability、confidence 和 effort 语义；
+- 机器可读的 [task-analysis.schema.json](docs/task-analysis.schema.json)；
+- artifact 版本、Metal/CPU 行为和 Router fallback 建议。
+
+训练产物位于本机 `artifacts/trendmodel-text-v1/`，不提交到 Git。下游只需要复制整个 artifact 目录以及兼容的 Python/TensorFlow runtime。
+
 ## 当前架构
 
 ```text
@@ -235,7 +248,7 @@ python3 -m trendmodel.tf_train predict \
 `artifacts/trendmodel-text-v1/metadata.json` 会记录 `physical_devices`、
 `gpu_devices` 和 `accelerator`，可用来确认本次训练实际使用的设备。
 
-HTTP/OpenAI-compatible adapter 也不属于这个项目的核心，当前只作为 legacy 兼容代码保留；下游项目建议直接调用 `TaskTagger` 或把 Task IR 序列化后传递给 router。
+项目同时提供本地 HTTP/OpenAI-compatible adapter。它不是远程大模型服务，而是对本地 TensorFlow artifact 的协议包装；启动方式、请求限制和响应解析见 [下游集成手册](docs/INTEGRATION.md)。如果下游与模型位于同一 Python 进程，优先直接调用 `TensorFlowTaskModel`，避免额外的 HTTP 和 JSON 字符串解析。
 
 ## 验证
 

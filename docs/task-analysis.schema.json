@@ -1,0 +1,148 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:trendmodel:task-analysis:v1",
+  "title": "TrendModel Task Analysis",
+  "description": "Router-facing JSON returned by the local TensorFlow task classifier.",
+  "type": "object",
+  "required": [
+    "original_prompt",
+    "workload_type",
+    "intent",
+    "complexity",
+    "predictions",
+    "effort",
+    "evidence",
+    "fusion",
+    "needs_clarification",
+    "clarification_reasons",
+    "confidence",
+    "model_version"
+  ],
+  "properties": {
+    "original_prompt": {"type": "string"},
+    "workload_type": {"$ref": "#/$defs/workloadLabel"},
+    "intent": {"$ref": "#/$defs/intentLabel"},
+    "complexity": {"$ref": "#/$defs/complexityLabel"},
+    "predictions": {
+      "type": "object",
+      "required": ["workload_type", "intent", "complexity", "effort"],
+      "properties": {
+        "workload_type": {"$ref": "#/$defs/classificationHead"},
+        "intent": {"$ref": "#/$defs/classificationHead"},
+        "complexity": {"$ref": "#/$defs/classificationHead"},
+        "effort": {"$ref": "#/$defs/effort"}
+      },
+      "additionalProperties": true
+    },
+    "effort": {"$ref": "#/$defs/effort"},
+    "evidence": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/evidence"}
+    },
+    "fusion": {
+      "type": "object",
+      "required": ["semantic_model", "structural_teacher", "policy"],
+      "properties": {
+        "semantic_model": {"type": "string"},
+        "structural_teacher": {"type": "string"},
+        "policy": {"type": "string"}
+      },
+      "additionalProperties": true
+    },
+    "needs_clarification": {"type": "boolean"},
+    "clarification_reasons": {
+      "type": "array",
+      "items": {"type": "string"}
+    },
+    "confidence": {
+      "type": "object",
+      "required": ["workload_type", "intent", "complexity", "effort", "overall"],
+      "properties": {
+        "workload_type": {"$ref": "#/$defs/probability"},
+        "intent": {"$ref": "#/$defs/probability"},
+        "complexity": {"$ref": "#/$defs/probability"},
+        "effort": {"$ref": "#/$defs/probability"},
+        "overall": {"$ref": "#/$defs/probability"}
+      },
+      "additionalProperties": true
+    },
+    "model_version": {"type": "string"}
+  },
+  "additionalProperties": true,
+  "$defs": {
+    "probability": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "workloadLabel": {
+      "type": "string",
+      "enum": ["text", "code", "analysis", "operations", "planning", "mixed", "other", "unknown"]
+    },
+    "intentLabel": {
+      "type": "string",
+      "enum": ["create", "modify", "debug", "explain", "execute", "analyze", "review", "summarize", "translate", "plan", "extract", "classify", "unknown"]
+    },
+    "complexityLabel": {
+      "type": "string",
+      "enum": ["low", "medium", "high"]
+    },
+    "classificationHead": {
+      "type": "object",
+      "required": ["label", "probability", "candidates"],
+      "properties": {
+        "label": {"type": "string"},
+        "probability": {"$ref": "#/$defs/probability"},
+        "candidates": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["label", "probability"],
+            "properties": {
+              "label": {"type": "string"},
+              "probability": {"$ref": "#/$defs/probability"}
+            },
+            "additionalProperties": true
+          }
+        }
+      },
+      "additionalProperties": true
+    },
+    "effort": {
+      "type": "object",
+      "required": ["label", "estimated_minutes", "range_minutes", "confidence", "basis"],
+      "properties": {
+        "label": {"type": "string", "enum": ["XS", "S", "M", "L", "XL", "unknown"]},
+        "estimated_minutes": {"type": ["integer", "null"], "minimum": 1},
+        "range_minutes": {
+          "type": ["array", "null"],
+          "prefixItems": [
+            {"type": "integer", "minimum": 0},
+            {"type": "integer", "minimum": 0}
+          ],
+          "items": false,
+          "minItems": 2,
+          "maxItems": 2
+        },
+        "confidence": {"$ref": "#/$defs/probability"},
+        "basis": {
+          "type": "string",
+          "enum": ["bucket_seed_only", "trained_observed_effort_head", "no_effort_supervision"]
+        }
+      },
+      "additionalProperties": true
+    },
+    "evidence": {
+      "type": "object",
+      "required": ["kind", "label", "value", "strength", "detail"],
+      "properties": {
+        "kind": {"type": "string"},
+        "label": {"type": "string"},
+        "value": {"type": ["string", "boolean", "number"]},
+        "strength": {"$ref": "#/$defs/probability"},
+        "detail": {"type": "string"}
+      },
+      "additionalProperties": true
+    }
+  }
+}
