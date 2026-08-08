@@ -17,6 +17,9 @@ TrendModel 是给 Auto Router 使用的轻量级 prompt 标签模型。它只负
 - 机器可读的 [task-analysis.schema.json](docs/task-analysis.schema.json)；
 - artifact 版本、Metal/CUDA/CPU 行为和 Router fallback 建议。
 
+想了解为什么采用当前的数据、模型结构、证据融合和 effort 监督方式，请阅读
+[设计说明](docs/DESIGN.md)。
+
 训练产物位于本机 `artifacts/trendmodel-text-v1/`，不提交到 Git。下游只需要复制整个 artifact 目录以及兼容的 Python/TensorFlow runtime。公共数据集的筛选、许可证和本机 adapter 见 [数据集说明](docs/DATASETS.md)。
 
 ## 当前架构
