@@ -1,6 +1,6 @@
 # TrendModel：面向 Auto Router 的轻量级任务分析模型
 
-> 论文式系统设计文档；实现基线：`model_version = 0.4.0`
+> 论文式系统设计文档；实现基线：`model_version = 0.5.0`
 
 ## 摘要
 
@@ -327,7 +327,7 @@ Task IR 不是以下任何东西：
 - 不是最终生成答案；
 - 不是工具权限或安全审批；`execute` 和 `high_risk` 仍需下游策略确认。
 
-原型 `TaskTagger` 直接构造 `TaskIR` dataclass，字段包括 `intent`、`domains`、`workload_type`、`artifact`、`operations`、`language`、`constraints`、`capability_demand`、`complexity`、`effort`、`risk_level`、`confidence`、`needs_clarification` 和 `evidence`（实现见 [`trendmodel/task_ir.py`](../trendmodel/task_ir.py) 和 [`trendmodel/tagger.py`](../trendmodel/tagger.py)）。`TaskIR.to_dict()` 保留 prototype 的旧直接字段，并增加 `task_ir` canonical object。
+原型 `TaskTagger` 直接构造 `TaskIR` dataclass，字段包括 `intent`、`domains`、`workload_type`、`artifact`、`operations`、`language`、`constraints`、`capability_demand`、`complexity`、`effort`、`risk_level`、`confidence`、`needs_clarification`、`abstention` 和 `evidence`（实现见 [`trendmodel/task_ir.py`](../trendmodel/task_ir.py) 和 [`trendmodel/tagger.py`](../trendmodel/tagger.py)）。`TaskIR.to_dict()` 保留 prototype 的旧直接字段，并增加 `task_ir` canonical object。
 
 TensorFlow 主模型的 `TensorFlowTaskModel.predict()` 为兼容现有 Router 保留最外层的 `workload_type`、`intent`、`complexity`、`predictions` 等字段，同时通过 `TaskIR.from_tensorflow()` 生成 `task_ir` canonical object（实现见 [`trendmodel/task_ir.py`](../trendmodel/task_ir.py) 和 [`trendmodel/tf_inference.py`](../trendmodel/tf_inference.py)）。它与 prototype 共享 `task_ir.contract_version == "task-ir-v1"` 的字段集合；TensorFlow 当前没有独立的 domain/artifact heads，因此这两类字段在 canonical object 中明确标记为 TaskAST-derived 的候选，而不是伪造神经输出。
 
@@ -600,18 +600,19 @@ Output:
 7.  h ← Fuse(h_char, h_ngram, Dense(s_struct))
 8.  p_raw ← MultiTaskHeads(h)
     where heads = workload, intent, complexity, effort_bucket,
-    effort_log_minutes and needs_clarification.
+    effort_ordinal, effort_log_minutes and needs_clarification.
 9.  evidence ← Serialize(A.evidence)
     # return the observable TaskAST signals; do not alter p_raw.
 10. effort ← ConvertEffortHeads(p_raw, complexity, observed_effort_metadata)
 11. uncertainty ← Compute(probability, entropy, margin, overall_confidence)
-12. clarification ← ApplyClarificationPolicy(p_raw, x_raw)
-13. y ← BuildTaskIRJSON(x_raw, predictions=p_raw, effort, evidence,
-                         fusion_metadata, uncertainty)
+12. abstention ← ApplyAbstentionPolicy(predictions, metadata)
+13. clarification ← ApplyClarificationPolicy(p_raw, x_raw, abstention)
+14. y ← BuildTaskIRJSON(x_raw, predictions=p_raw, effort, evidence,
+                         abstention, fusion_metadata, uncertainty)
 14. return y
 ```
 
-步骤 3 先生成一份 TaskAST；步骤 4 把这份 AST 编码成 56 维结构化输入，步骤 9 返回同一份 AST 的 evidence，避免训练输入和审计输出来自两套规则。步骤 10–12 都不会把证据再混入分类概率；`needs_clarification` 是独立的路由安全信号。旧的 `TaskTagger` 仍可作为 prototype 运行，但不再是 TensorFlow 主推理的第二个概率来源。
+步骤 3 先生成一份 TaskAST；步骤 4 把这份 AST 编码成 56 维结构化输入，步骤 9 返回同一份 AST 的 evidence，避免训练输入和审计输出来自两套规则。步骤 10–13 都不会把证据再混入分类概率；abstention 只读取已经产生的概率和不确定性，不修改 label。`needs_clarification` 是独立的路由安全信号。旧的 `TaskTagger` 仍可作为 prototype 运行，但不再是 TensorFlow 主推理的第二个概率来源。
 
 核心思想不是用一个算法解决所有问题，而是给不同类型的信号分配不同的责任：
 
@@ -1176,6 +1177,36 @@ effort 的权重较低，是因为当前真实 `active_minutes` 仍然稀缺。
 - 只有“帮我弄一下”“看看这个”之类模糊动作；
 - clarification head 概率达到阈值；
 - 缺少任务目标、交付物或操作范围。
+
+### 14.1 Abstention（拒识）
+
+`abstention` 是一个独立的 uncertainty policy，不是第五个分类标签。新训练 artifact 的默认配置是：
+
+```json
+{
+  "enabled": true,
+  "min_probability": 0.45,
+  "min_margin": 0.05,
+  "max_entropy": 0.98
+}
+```
+
+它检查 workload、intent 和 complexity 三个 head：任一 head 的 top-1 probability 低于下限、top-1/top-2 margin 过小、entropy 过高，便返回：
+
+```json
+{
+  "enabled": true,
+  "abstain": true,
+  "reasons": ["intent:low_margin"],
+  "thresholds": {
+    "min_probability": 0.45,
+    "min_margin": 0.05,
+    "max_entropy": 0.98
+  }
+}
+```
+
+拒识只会把 `needs_clarification` 置为 `true` 并暴露原因，不会把原来的预测 label 改成 `unknown`，也不会修改 TensorFlow head 的 probability。Router 可以据此选择低成本 fallback、请求用户补充信息，或在高风险场景停止自动路由。旧 artifact 没有 `abstention` metadata 时，输出 `enabled=false`，保持兼容。
 
 如果请求需要澄清且没有结构化证据，模型会把 workload 和 intent 降级为 `unknown`。这是为了避免 Router 把不明确的请求误送到高成本或高风险路径。
 

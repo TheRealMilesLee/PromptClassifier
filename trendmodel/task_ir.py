@@ -166,6 +166,7 @@ class TaskIR:
     needs_clarification: bool
     evidence: tuple[TaskEvidence, ...]
     secondary_intents: tuple[TaskPrediction, ...] = ()
+    abstention: Mapping[str, Any] = field(default_factory=dict)
     model_version: str = "task-ir-v1"
     fusion: Mapping[str, Any] = field(default_factory=dict)
     confidence_by_head: Mapping[str, float] = field(default_factory=dict)
@@ -194,6 +195,7 @@ class TaskIR:
             "confidence": clamp_probability(self.confidence),
             "needs_clarification": self.needs_clarification,
             "evidence": [item.to_dict() for item in self.evidence],
+            "abstention": _json_value(dict(self.abstention)),
         }
         # Keep the original prototype shape while exposing one canonical
         # contract that the TensorFlow adapter can produce as well.
@@ -237,6 +239,7 @@ class TaskIR:
             "confidence": confidence,
             "needs_clarification": self.needs_clarification,
             "evidence": [item.to_dict() for item in self.evidence],
+            "abstention": _json_value(dict(self.abstention)),
             "fusion": _json_value(fusion),
             "model_version": self.model_version,
         }
@@ -252,6 +255,7 @@ class TaskIR:
         needs_clarification: bool,
         model_version: str,
         fusion: Mapping[str, Any],
+        abstention: Mapping[str, Any] | None = None,
     ) -> "TaskIR":
         """Adapt TensorFlow heads and TaskAST into the canonical Task IR.
 
@@ -308,6 +312,7 @@ class TaskIR:
             needs_clarification=bool(needs_clarification),
             evidence=evidence,
             secondary_intents=secondary_intents,
+            abstention=dict(abstention or {}),
             model_version=model_version,
             fusion=fusion,
             confidence_by_head=confidence_by_head,

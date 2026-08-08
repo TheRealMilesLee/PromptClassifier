@@ -2,7 +2,7 @@
 
 本文档是另一个项目接入 TrendModel 的主入口。TrendModel 只负责把用户 prompt 转换成路由标签和不确定性信息，不负责生成最终答案、选择具体供应商模型或执行工具。
 
-当前推荐 artifact：`trendmodel-text-v1`。重新训练后模型版本为 `0.4.0`，它包含内置 TaskAST structured feature branch、受控类别重加权、`effort_bucket` 分类头和 ordinal effort head；已有 text-only/旧 bucket artifact 仍可被兼容加载。
+当前推荐 artifact：`trendmodel-text-v1`。重新训练后模型版本为 `0.5.0`，它包含内置 TaskAST structured feature branch、受控类别重加权、`effort_bucket` 分类头、ordinal effort head 和 abstention policy；已有 text-only/旧 bucket artifact 仍可被兼容加载。
 
 ## 1. 选择接入方式
 
@@ -221,6 +221,7 @@ analysis = json.loads(response.choices[0].message.content)
 | `fusion` | `object` | TensorFlow 模型、TaskAST schema 和是否启用 post-hoc probability fusion |
 | `needs_clarification` | `boolean` | 是否需要补充信息或人工确认 |
 | `clarification_reasons` | `array[string]` | 触发澄清的原因 |
+| `abstention` | `object` | 低置信度拒识状态、原因和阈值 |
 | `confidence` | `object` | 各 head 最高分和整体路由分数 |
 | `model_version` | `string` | artifact metadata 中的模型版本 |
 
@@ -356,7 +357,7 @@ complexity:
 ```text
 TrendModel JSON
   ↓
-检查 needs_clarification / unknown / risk
+检查 abstention / needs_clarification / unknown / risk
   ↓
 读取 workload、intent、complexity、effort bucket
   ↓

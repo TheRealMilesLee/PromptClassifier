@@ -14,7 +14,7 @@ from .tf_data import (
     bucket_from_minutes,
     normalize_model_text,
 )
-from .calibration import calibration_temperature, temperature_scale
+from .calibration import abstention_decision, calibration_temperature, temperature_scale
 from .evidence import extract_evidence
 from .task_ast import TaskAST
 from .task_ir import TaskIR
@@ -105,6 +105,12 @@ class TensorFlowTaskModel:
             ),
             "effort": effort_payload,
         }
+        abstention = abstention_decision(prediction_payload, self.metadata)
+        for reason in abstention.get("reasons", []):
+            formatted_reason = f"模型拒识: {reason}"
+            if formatted_reason not in reasons:
+                reasons.append(formatted_reason)
+        needs_clarification = needs_clarification or bool(abstention.get("abstain", False))
         overall_confidence = round(
             max(
                 0.0,
@@ -139,6 +145,7 @@ class TensorFlowTaskModel:
             needs_clarification=needs_clarification,
             model_version=str(self.metadata.get("model_version", "0.1.0")),
             fusion=fusion_metadata,
+            abstention=abstention,
         )
 
         return {
@@ -162,6 +169,7 @@ class TensorFlowTaskModel:
             },
             "needs_clarification": needs_clarification,
             "clarification_reasons": reasons,
+            "abstention": abstention,
             "confidence": confidence_payload,
             "model_version": self.metadata.get("model_version", "0.1.0"),
         }
@@ -334,33 +342,42 @@ def _raw_prediction_payload(
         "post_hoc_probability_fusion": False,
         "policy": "TensorFlow consumes TaskAST features internally; raw output exposes neural probabilities without post-hoc fusion",
     }
+    prediction_payload = {
+        "workload_type": _classification_payload(
+            workload_type,
+            workload_probabilities,
+            workload_labels,
+        ),
+        "intent": _classification_payload(
+            intent,
+            intent_probabilities,
+            intent_labels,
+        ),
+        "complexity": _classification_payload(
+            complexity,
+            complexity_probabilities,
+            complexity_labels,
+        ),
+        "effort": effort_payload,
+    }
+    reasons = _clarification_reasons(prompt, clarification_probability)
+    abstention = abstention_decision(prediction_payload, metadata)
+    for reason in abstention.get("reasons", []):
+        formatted_reason = f"模型拒识: {reason}"
+        if formatted_reason not in reasons:
+            reasons.append(formatted_reason)
+    needs_clarification = bool(reasons) or bool(abstention.get("abstain", False))
     task_ir = None
     if task_ast is not None:
         task_ir = TaskIR.from_tensorflow(
-            predictions={
-                "workload_type": _classification_payload(
-                    workload_type,
-                    workload_probabilities,
-                    workload_labels,
-                ),
-                "intent": _classification_payload(
-                    intent,
-                    intent_probabilities,
-                    intent_labels,
-                ),
-                "complexity": _classification_payload(
-                    complexity,
-                    complexity_probabilities,
-                    complexity_labels,
-                ),
-                "effort": effort_payload,
-            },
+            predictions=prediction_payload,
             effort=effort_payload,
             task_ast=task_ast,
             confidence=confidence_payload,
-            needs_clarification=clarification_probability >= 0.5,
+            needs_clarification=needs_clarification,
             model_version=str(metadata.get("model_version", "0.1.0")),
             fusion=fusion_metadata,
+            abstention=abstention,
         )
 
     result = {
@@ -368,24 +385,7 @@ def _raw_prediction_payload(
         "workload_type": workload_type,
         "intent": intent,
         "complexity": complexity,
-        "predictions": {
-            "workload_type": _classification_payload(
-                workload_type,
-                workload_probabilities,
-                workload_labels,
-            ),
-            "intent": _classification_payload(
-                intent,
-                intent_probabilities,
-                intent_labels,
-            ),
-            "complexity": _classification_payload(
-                complexity,
-                complexity_probabilities,
-                complexity_labels,
-            ),
-            "effort": effort_payload,
-        },
+        "predictions": prediction_payload,
         "effort": {
             "bucket": effort_payload["label"],
             "estimated_minutes": effort_payload["estimated_minutes"],
@@ -394,7 +394,9 @@ def _raw_prediction_payload(
             "basis": effort_payload["basis"],
         },
         "evidence": list(evidence or []),
-        "needs_clarification": clarification_probability >= 0.5,
+        "needs_clarification": needs_clarification,
+        "clarification_reasons": reasons,
+        "abstention": abstention,
         "confidence": confidence_payload,
         "fusion": fusion_metadata,
     }

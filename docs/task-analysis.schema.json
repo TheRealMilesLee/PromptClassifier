@@ -16,6 +16,7 @@
     "fusion",
     "needs_clarification",
     "clarification_reasons",
+    "abstention",
     "confidence",
     "model_version"
   ],
@@ -62,6 +63,7 @@
       "type": "array",
       "items": {"type": "string"}
     },
+    "abstention": {"$ref": "#/$defs/abstention"},
     "confidence": {
       "type": "object",
       "required": ["workload_type", "intent", "complexity", "effort", "overall"],
@@ -216,6 +218,7 @@
         "confidence",
         "needs_clarification",
         "evidence",
+        "abstention",
         "fusion",
         "model_version"
       ],
@@ -249,6 +252,7 @@
           "additionalProperties": {"$ref": "#/$defs/probability"}
         },
         "needs_clarification": {"type": "boolean"},
+        "abstention": {"$ref": "#/$defs/abstention"},
         "evidence": {
           "type": "array",
           "items": {"$ref": "#/$defs/evidence"}
@@ -295,6 +299,28 @@
         "task_ast_schema": {"type": "string"},
         "post_hoc_probability_fusion": {"type": "boolean"},
         "policy": {"type": "string"}
+      },
+      "additionalProperties": true
+    },
+    "abstention": {
+      "type": "object",
+      "required": ["enabled", "abstain", "reasons"],
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "abstain": {"type": "boolean"},
+        "reasons": {
+          "type": "array",
+          "items": {"type": "string"}
+        },
+        "thresholds": {
+          "type": "object",
+          "properties": {
+            "min_probability": {"$ref": "#/$defs/probability"},
+            "min_margin": {"$ref": "#/$defs/probability"},
+            "max_entropy": {"$ref": "#/$defs/probability"}
+          },
+          "additionalProperties": true
+        }
       },
       "additionalProperties": true
     }

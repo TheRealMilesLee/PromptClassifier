@@ -4,6 +4,7 @@ import unittest
 from types import SimpleNamespace
 
 from trendmodel.calibration import (
+    abstention_decision,
     expected_calibration_error,
     fit_head_calibration,
     fit_temperature,
@@ -88,6 +89,20 @@ class CalibrationTest(unittest.TestCase):
 
         self.assertEqual(result["eligible_samples"], 1)
         self.assertEqual(result["heads"]["intent"]["samples"], 1)
+
+    def test_abstention_is_explicit_and_does_not_mutate_labels(self) -> None:
+        decision = abstention_decision(
+            {
+                "workload_type": {"label": "code", "probability": 0.8, "margin": 0.6, "entropy": 0.4},
+                "intent": {"label": "create", "probability": 0.44, "margin": 0.02, "entropy": 0.99},
+                "complexity": {"label": "high", "probability": 0.7, "margin": 0.4, "entropy": 0.5},
+            },
+            {"abstention": {"enabled": True, "min_probability": 0.45, "min_margin": 0.05, "max_entropy": 0.98}},
+        )
+
+        self.assertTrue(decision["abstain"])
+        self.assertIn("intent:low_probability", decision["reasons"])
+        self.assertIn("thresholds", decision)
 
 
 if __name__ == "__main__":

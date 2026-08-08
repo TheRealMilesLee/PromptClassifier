@@ -125,10 +125,16 @@ def train_model(
     warnings = _training_warnings(supervision_counts)
     metadata = {
         "model_id": "trendmodel-text-v1",
-        "model_version": "0.4.0",
+        "model_version": "0.5.0",
         "architecture": "TextVectorization(character) + Embedding + BiGRU + character n-gram TF-IDF branch + integrated TaskAST feature branch + multi-task heads (including effort bucket and ordinal effort)",
         "task_ast_schema": TaskAST.schema_version,
         "post_hoc_probability_fusion": False,
+        "abstention": {
+            "enabled": True,
+            "min_probability": 0.45,
+            "min_margin": 0.05,
+            "max_entropy": 0.98,
+        },
         "text_encoder": {
             "character_max_tokens": 12_000,
             "character_sequence_length": 192,

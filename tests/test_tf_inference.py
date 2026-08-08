@@ -244,6 +244,35 @@ class TensorFlowInferenceContractTest(unittest.TestCase):
         self.assertLess(result["predictions"]["workload_type"]["probability"], 0.8)
         self.assertEqual(set(result["predictions"]["workload_type"]["distribution"]), {"text", "code"})
 
+    def test_abstention_sets_clarification_without_relabeling(self) -> None:
+        model = _FakeKerasModel()
+        metadata = {
+            "model_id": "test-model",
+            "structured_feature_dim": 56,
+            "labels": {
+                "workload_type": ["text", "code"],
+                "intent": ["explain", "create"],
+                "complexity": ["low", "high"],
+                "effort_bucket": ["XS", "S", "M", "L", "XL"],
+            },
+            "effort_bucket_supervision_samples": 10,
+            "abstention": {
+                "enabled": True,
+                "min_probability": 0.75,
+                "min_margin": 0.05,
+                "max_entropy": 0.98,
+            },
+        }
+
+        with patch("trendmodel.tf_inference.require_tensorflow", return_value=_FakeTensorFlow):
+            result = TensorFlowTaskModel(model, metadata).predict("解释 ./output.py")
+
+        self.assertEqual(result["intent"], "explain")
+        self.assertTrue(result["needs_clarification"])
+        self.assertTrue(result["abstention"]["abstain"])
+        self.assertTrue(result["task_ir"]["abstention"]["abstain"])
+        self.assertTrue(any(reason.startswith("模型拒识:") for reason in result["clarification_reasons"]))
+
 
 if __name__ == "__main__":
     unittest.main()
