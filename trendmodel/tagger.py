@@ -18,6 +18,7 @@ from .task_ir import (
     TaskIR,
     TaskPrediction,
     clamp_probability,
+    secondary_intent_predictions,
 )
 
 
@@ -180,6 +181,10 @@ class TaskTagger:
             confidence=clamp_probability(overall_confidence),
             needs_clarification=needs_clarification,
             evidence=evidence.signals,
+            secondary_intents=secondary_intent_predictions(
+                evidence.intent_scores,
+                primary_label=intent_label,
+            ),
             model_version=self.model_version,
             fusion={
                 "semantic_model": self.model_version,

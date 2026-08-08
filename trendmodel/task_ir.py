@@ -41,6 +41,7 @@ class TaskPrediction:
     probability: float
     candidates: tuple[LabelCandidate, ...] = ()
     name: str | None = None
+    source: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         result: dict[str, Any] = {
@@ -50,6 +51,8 @@ class TaskPrediction:
         }
         if self.name is not None:
             result["name"] = self.name
+        if self.source is not None:
+            result["source"] = self.source
         return result
 
 
@@ -162,6 +165,7 @@ class TaskIR:
     confidence: float
     needs_clarification: bool
     evidence: tuple[TaskEvidence, ...]
+    secondary_intents: tuple[TaskPrediction, ...] = ()
     model_version: str = "task-ir-v1"
     fusion: Mapping[str, Any] = field(default_factory=dict)
     confidence_by_head: Mapping[str, float] = field(default_factory=dict)
@@ -174,6 +178,8 @@ class TaskIR:
         result = {
             "original_prompt": self.original_prompt,
             "intent": self.intent.to_dict(),
+            "primary_intent": self.intent.to_dict(),
+            "secondary_intents": [item.to_dict() for item in self.secondary_intents],
             "domains": [domain.to_dict() for domain in self.domains],
             "workload_type": self.workload_type.to_dict(),
             "artifact": self.artifact,
@@ -215,6 +221,8 @@ class TaskIR:
             "contract_version": self.contract_version,
             "original_prompt": self.original_prompt,
             "intent": self.intent.to_dict(),
+            "primary_intent": self.intent.to_dict(),
+            "secondary_intents": [item.to_dict() for item in self.secondary_intents],
             "domains": [domain.to_dict() for domain in self.domains],
             "workload_type": self.workload_type.to_dict(),
             "artifact": self.artifact,
@@ -252,9 +260,9 @@ class TaskIR:
         presented as hidden neural predictions.
         """
 
-        intent = _prediction_from_mapping(predictions.get("intent", {}))
-        workload = _prediction_from_mapping(predictions.get("workload_type", {}))
-        complexity = _prediction_from_mapping(predictions.get("complexity", {}))
+        intent = _prediction_from_mapping(predictions.get("intent", {}), source="tensorflow_head")
+        workload = _prediction_from_mapping(predictions.get("workload_type", {}), source="tensorflow_head")
+        complexity = _prediction_from_mapping(predictions.get("complexity", {}), source="tensorflow_head")
         domain_scores = _mapping_scores(getattr(task_ast, "domain_scores", {}))
         domains = _predictions_from_scores(domain_scores)
         artifact_scores = _mapping_scores(getattr(task_ast, "artifact_scores", {}))
@@ -273,6 +281,10 @@ class TaskIR:
         )
         risk_level = _risk_from_task_ast(task_ast, intent_label)
         evidence = tuple(getattr(task_ast, "evidence", getattr(task_ast, "signals", ())))
+        secondary_intents = secondary_intent_predictions(
+            getattr(task_ast, "intent_scores", {}),
+            primary_label=intent.label,
+        )
         confidence_by_head = {
             str(label): float(value)
             for label, value in confidence.items()
@@ -295,6 +307,7 @@ class TaskIR:
             confidence=float(confidence.get("overall", 0.0)),
             needs_clarification=bool(needs_clarification),
             evidence=evidence,
+            secondary_intents=secondary_intents,
             model_version=model_version,
             fusion=fusion,
             confidence_by_head=confidence_by_head,
@@ -304,7 +317,7 @@ class TaskIR:
     as_dict = to_dict
 
 
-def _prediction_from_mapping(value: Any) -> TaskPrediction:
+def _prediction_from_mapping(value: Any, *, source: str | None = None) -> TaskPrediction:
     if not isinstance(value, Mapping):
         value = {}
     candidates = tuple(
@@ -322,6 +335,33 @@ def _prediction_from_mapping(value: Any) -> TaskPrediction:
         probability=float(value.get("probability", 0.0)),
         candidates=candidates,
         name=value.get("name"),
+        source=source or value.get("source"),
+    )
+
+
+def secondary_intent_predictions(
+    scores: Mapping[str, float],
+    *,
+    primary_label: str,
+    limit: int = 3,
+) -> tuple[TaskPrediction, ...]:
+    """Return additional intent evidence without collapsing it into one label."""
+
+    ordered = [
+        (str(label), max(0.0, min(1.0, float(score))))
+        for label, score in scores.items()
+        if str(label) != primary_label and float(score) > 0.0
+    ]
+    ordered.sort(key=lambda item: (-item[1], item[0]))
+    return tuple(
+        TaskPrediction(
+            label=label,
+            probability=score,
+            candidates=(LabelCandidate(label, score),),
+            name=label,
+            source="task_ast",
+        )
+        for label, score in ordered[:limit]
     )
 
 

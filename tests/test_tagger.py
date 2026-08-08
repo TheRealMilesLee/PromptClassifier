@@ -27,6 +27,8 @@ class TaskTaggerTest(unittest.TestCase):
         self.assertEqual(result["task_ir"]["contract_version"], "task-ir-v1")
         self.assertEqual(result["task_ir"]["workload_type"]["label"], "code")
         self.assertTrue(result["task_ir"]["fusion"]["post_hoc_probability_fusion"])
+        self.assertEqual(result["task_ir"]["primary_intent"]["label"], "create")
+        self.assertTrue(all(item["source"] == "task_ast" for item in result["task_ir"]["secondary_intents"]))
         json.dumps(result, ensure_ascii=False)
 
         python_result = self.tagger.predict("实现一个 Python 函数，把 CSV 转换成 JSON").to_dict()
@@ -56,6 +58,10 @@ class TaskTaggerTest(unittest.TestCase):
         self.assertEqual(implementation["workload_type"]["label"], "code")
         self.assertIn("networking", [item["label"] for item in implementation["domains"]])
         self.assertIn("programming", [item["label"] for item in implementation["domains"]])
+
+        multi_action = self.tagger.predict("请分析并解释 C++ 多线程原理").to_dict()
+        self.assertEqual(multi_action["task_ir"]["primary_intent"]["label"], "explain")
+        self.assertIn("analyze", [item["label"] for item in multi_action["task_ir"]["secondary_intents"]])
 
         self.assertEqual(operation["intent"]["label"], "execute")
         self.assertIn("shell", [item["label"] for item in operation["domains"]])

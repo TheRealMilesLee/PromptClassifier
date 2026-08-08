@@ -194,6 +194,8 @@
         "contract_version",
         "original_prompt",
         "intent",
+        "primary_intent",
+        "secondary_intents",
         "domains",
         "workload_type",
         "artifact",
@@ -215,6 +217,11 @@
         "contract_version": {"const": "task-ir-v1"},
         "original_prompt": {"type": "string"},
         "intent": {"$ref": "#/$defs/classificationHead"},
+        "primary_intent": {"$ref": "#/$defs/classificationHead"},
+        "secondary_intents": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/classificationHead"}
+        },
         "domains": {
           "type": "array",
           "items": {"$ref": "#/$defs/classificationHead"}
