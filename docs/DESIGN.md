@@ -234,7 +234,7 @@ TaskRequest
 | `constraints` | `TaskConstraints` | 文件、工具、代码块、路径、命令、数学符号、URL 等布尔事实 | 否 |
 | `language` | `"python"`、`"cpp"`、`"shell"` | 规则检测到的语言或命令环境 | 否 |
 | `operations` | `("dns", "kubernetes")` | 检测到的技术操作或对象 | 否 |
-| `signals` / `evidence` | `TaskEvidence` 序列 | 每个可观察信号的 kind、label、value、strength 和 detail | 否 |
+| `signals` / `evidence` | `TaskEvidence` 序列 | 每个可观察信号的 kind、label、value、strength、detail、source span、rule id、否定/引用状态 | 否 |
 | `intent_scores` | `{"debug": 0.97}` | 动作候选的规则证据分数 | 否 |
 | `domain_scores` | `{"operations": 0.80}` | 领域候选的规则证据分数 | 否 |
 | `artifact_scores` | `{"command": 0.90}` | 交付物候选的规则证据分数 | 否 |
@@ -255,8 +255,11 @@ TaskAST 的几个不变量是：
 2. 候选分数必须在 `[0, 1]`；
 3. `operations` 和 `risk_reasons` 不允许出现空标签；
 4. evidence 是可观察信号，不是模型自由生成的解释；
-5. `requires_tools=true` 和 `high_risk=true` 只是路由/安全输入，绝不等于已经获得工具权限；
-6. `schema_version` 当前为 `task-ast-v1`，用于未来演进和回放。
+5. 每条 evidence 的 `strength` 必须在 `[0, 1]`，`source_span` 必须是原始 prompt 的有序字符区间；
+6. `negated=true` 或 `quoted=true` 的 signal 可以被审计，但不能自动等同于用户要求执行；
+7. `intent_scores`、`domain_scores` 和 `artifact_scores` 在构造后是深层只读 mapping，避免推理链路中的隐式改写；
+8. `requires_tools=true` 和 `high_risk=true` 只是路由/安全输入，绝不等于已经获得工具权限；
+9. `schema_version` 当前为 `task-ast-v1`，用于未来演进和回放。
 
 当前保留 `signals` 字段是为了兼容旧调用方；新代码可以使用语义更清楚的 `evidence` 属性。`action_scores` 是 `intent_scores` 的 AST-oriented 别名。两者都指向候选证据，不是最终 intent label。
 
@@ -456,7 +459,7 @@ risk:
   reasons=(production, migration_or_release)
 ```
 
-这一步没有“授权 kubectl”，也没有“决定必须使用某个大模型”。它只报告文本中观察到的事实和候选解释。`requires_tools=true` 的真正含义是：下游应该检查是否允许工具调用；如果没有权限，Router 必须选择解释/规划路径，而不是执行路径。
+这一步没有“授权 kubectl”，也没有“决定必须使用某个大模型”。它只报告文本中观察到的事实和候选解释。`requires_tools=true` 的真正含义是：下游应该检查是否允许工具调用；如果没有权限，Router 必须选择解释/规划路径，而不是执行路径。对于“不要执行 kubectl…”或“解释 `rm -rf`”这样的 prompt，相关 command/risk evidence 仍会返回，但会带 `negated` 或 `quoted` 标记，active intent/risk 不会被错误激活。
 
 #### 第三步：编码成 TensorFlow 输入
 

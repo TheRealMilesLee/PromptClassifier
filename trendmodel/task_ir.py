@@ -93,22 +93,53 @@ class CapabilityDemand:
 
 @dataclass(frozen=True)
 class TaskEvidence:
-    """An observable signal used during fusion, not an opaque explanation."""
+    """An observable signal used during routing, not an opaque explanation."""
 
     kind: str
     label: str
     value: str | bool | float
     strength: float
     detail: str = ""
+    source_span: tuple[int, int] | None = None
+    rule_id: str = ""
+    negated: bool = False
+    quoted: bool = False
+
+    def __post_init__(self) -> None:
+        if not str(self.kind).strip():
+            raise ValueError("evidence kind must not be empty")
+        if not str(self.label).strip():
+            raise ValueError("evidence label must not be empty")
+        try:
+            numeric_strength = float(self.strength)
+        except (TypeError, ValueError) as error:
+            raise ValueError("evidence strength must be numeric") from error
+        if not 0.0 <= numeric_strength <= 1.0:
+            raise ValueError("evidence strength must be between 0 and 1")
+        object.__setattr__(self, "strength", numeric_strength)
+        object.__setattr__(self, "rule_id", str(self.rule_id))
+        if self.source_span is not None:
+            if len(self.source_span) != 2:
+                raise ValueError("source_span must contain start and end")
+            start, end = self.source_span
+            if not isinstance(start, int) or not isinstance(end, int) or start < 0 or start > end:
+                raise ValueError("source_span must be a non-negative ordered span")
+            object.__setattr__(self, "source_span", (start, end))
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        result = {
             "kind": self.kind,
             "label": self.label,
             "value": self.value,
             "strength": clamp_probability(self.strength),
             "detail": self.detail,
+            "rule_id": self.rule_id,
+            "negated": self.negated,
+            "quoted": self.quoted,
         }
+        if self.source_span is not None:
+            result["source_span"] = list(self.source_span)
+        return result
 
 
 @dataclass(frozen=True)

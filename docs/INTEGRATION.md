@@ -334,11 +334,18 @@ complexity:
   "label": "cpp",
   "value": "c++",
   "strength": 0.98,
-  "detail": "发现编程语言或语言特有标记"
+  "detail": "发现编程语言或语言特有标记",
+  "source_span": [7, 10],
+  "rule_id": "language:cpp",
+  "negated": false,
+  "quoted": false
 }
 ```
 
-`strength` 是结构化 extractor 对该信号的强度，不是最终类别 probability。常见 `kind` 包括 `language`、`intent_hint`、`operation`、`domain_hint`、`structure`、`constraint` 和 `risk`。
+`strength` 是结构化 extractor 对该信号的强度，不是最终类别 probability。`source_span`
+使用原始 prompt 的字符区间，`rule_id` 用于规则回放；`negated=true` 表示文本否定了
+该动作，`quoted=true` 表示它更可能是被引用、解释或讨论的内容。常见 `kind` 包括
+`language`、`intent_hint`、`operation`、`domain_hint`、`structure`、`constraint` 和 `risk`。
 
 ## 5. 推荐的 Router 决策方式
 

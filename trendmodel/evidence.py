@@ -25,22 +25,58 @@ def extract_evidence(text: str) -> TaskAST:
     original = str(text)
     if not original.strip():
         raise ValueError("text must not be empty")
-    normalized = unicodedata.normalize("NFKC", original).casefold()
-    compact = re.sub(r"\s+", " ", normalized).strip()
+    normalized, normalized_spans = _normalize_with_spans(original)
     signals: list[TaskEvidence] = []
     intent_scores: dict[str, float] = {}
     domain_scores: dict[str, float] = {}
     artifact_scores: dict[str, float] = {}
 
-    def signal(kind: str, label: str, value: str | bool | float, strength: float, detail: str) -> None:
-        signals.append(TaskEvidence(kind, label, value, strength, detail))
+    def signal(
+        kind: str,
+        label: str,
+        value: str | bool | float,
+        strength: float,
+        detail: str,
+        *,
+        match: re.Match[str] | None = None,
+        rule_id: str | None = None,
+        negated: bool = False,
+        quoted: bool = False,
+    ) -> None:
+        source_span = (
+            _span_to_original(match.span(), normalized_spans)
+            if match is not None
+            else None
+        )
+        signals.append(
+            TaskEvidence(
+                kind,
+                label,
+                value,
+                strength,
+                detail,
+                source_span=source_span,
+                rule_id=rule_id or f"{kind}:{label}",
+                negated=negated,
+                quoted=quoted,
+            )
+        )
 
     def score(target: dict[str, float], label: str, value: float) -> None:
         target[label] = max(target.get(label, 0.0), min(1.0, value))
 
     has_code_block = "```" in original or bool(re.search(r"(?m)^\s{4,}\S+", original))
     if has_code_block:
-        signal("structure", "code_block", True, 0.98, "发现 fenced 或缩进代码块")
+        code_match = _search(re.compile(r"```|^\s{4,}\S+", re.M), normalized)
+        signal(
+            "structure",
+            "code_block",
+            True,
+            0.98,
+            "发现 fenced 或缩进代码块",
+            match=code_match,
+            rule_id="structure:code_block",
+        )
         score(domain_scores, "programming", 0.95)
         score(artifact_scores, "source_code", 0.9)
 
@@ -48,25 +84,61 @@ def extract_evidence(text: str) -> TaskAST:
     has_file_paths = file_match is not None
     if file_match:
         value = _short_value(file_match.group(1) or file_match.group(0))
-        signal("structure", "file_path", value, 0.93, "发现文件路径或常见代码/配置文件名")
+        signal(
+            "structure",
+            "file_path",
+            value,
+            0.93,
+            "发现文件路径或常见代码/配置文件名",
+            match=file_match,
+            rule_id="structure:file_path",
+            quoted=_is_quoted(normalized, file_match.span()),
+        )
         score(artifact_scores, "source_code", 0.55)
         score(domain_scores, "programming", 0.5)
 
     url_match = _search(_URL_RE, normalized)
     has_urls = url_match is not None
     if url_match:
-        signal("structure", "url", _short_value(url_match.group(0)), 0.8, "发现 URL")
+        signal(
+            "structure",
+            "url",
+            _short_value(url_match.group(0)),
+            0.8,
+            "发现 URL",
+            match=url_match,
+            rule_id="structure:url",
+            quoted=_is_quoted(normalized, url_match.span()),
+        )
 
     math_match = _search(_MATH_RE, normalized)
     has_math_symbols = math_match is not None
     if math_match:
-        signal("structure", "math_symbols", _short_value(math_match.group(0)), 0.96, "发现数学符号、公式或数学术语")
+        signal(
+            "structure",
+            "math_symbols",
+            _short_value(math_match.group(0)),
+            0.96,
+            "发现数学符号、公式或数学术语",
+            match=math_match,
+            rule_id="structure:math_symbols",
+            quoted=_is_quoted(normalized, math_match.span()),
+        )
         score(domain_scores, "mathematics", 0.95)
         score(artifact_scores, "technical_explanation", 0.3)
 
     language, language_strength, language_match = _detect_language(normalized)
     if language:
-        signal("language", language, _short_value(language_match or language), language_strength, "发现编程语言或语言特有标记")
+        signal(
+            "language",
+            language,
+            _short_value(language_match.group(0) if language_match else language),
+            language_strength,
+            "发现编程语言或语言特有标记",
+            match=language_match,
+            rule_id=f"language:{language}",
+            quoted=_is_quoted(normalized, language_match.span()) if language_match else False,
+        )
         score(domain_scores, "programming", 0.92)
         score(artifact_scores, "source_code", 0.82)
 
@@ -86,7 +158,18 @@ def extract_evidence(text: str) -> TaskAST:
             if command_args_match
             else shell_match.group(0)
         )
-        signal("structure", "shell_command", _short_value(matched), 0.94, "发现 Shell/CLI 命令或命令行结构")
+        command_match = command_line_match or command_args_match or shell_match
+        signal(
+            "structure",
+            "shell_command",
+            _short_value(matched),
+            0.94,
+            "发现 Shell/CLI 命令或命令行结构",
+            match=command_match,
+            rule_id="structure:shell_command",
+            negated=_is_negated(normalized, command_match.span()) if command_match else False,
+            quoted=_is_quoted(normalized, command_match.span()) if command_match else False,
+        )
         score(domain_scores, "shell", 0.96)
         score(domain_scores, "operations", 0.58)
         score(artifact_scores, "command", 0.9)
@@ -97,8 +180,21 @@ def extract_evidence(text: str) -> TaskAST:
         match = _search(pattern, normalized)
         if not match:
             continue
-        score(intent_scores, label, strength)
-        signal("intent_hint", label, _short_value(match.group(0)), strength, "发现高置信动作短语")
+        negated = _is_negated(normalized, match.span())
+        quoted = _is_quoted(normalized, match.span())
+        if not negated:
+            score(intent_scores, label, strength)
+        signal(
+            "intent_hint",
+            label,
+            _short_value(match.group(0)),
+            strength,
+            "发现高置信动作短语",
+            match=match,
+            rule_id=f"intent:{label}",
+            negated=negated,
+            quoted=quoted,
+        )
 
     operations: list[str] = []
     for operation, pattern, strength in _OPERATION_RULES:
@@ -106,30 +202,73 @@ def extract_evidence(text: str) -> TaskAST:
         if not match:
             continue
         operations.append(operation)
-        signal("operation", operation, _short_value(match.group(0)), strength, "发现任务约束或技术操作")
+        signal(
+            "operation",
+            operation,
+            _short_value(match.group(0)),
+            strength,
+            "发现任务约束或技术操作",
+            match=match,
+            rule_id=f"operation:{operation}",
+            negated=_is_negated(normalized, match.span()),
+            quoted=_is_quoted(normalized, match.span()),
+        )
 
     _score_domains_from_terms(normalized, domain_scores, signal)
 
-    has_explicit_file_requirement = bool(
-        _search(_FILE_REQUIREMENT_RE, normalized)
-    )
+    file_requirement_match = _search(_FILE_REQUIREMENT_RE, normalized)
+    has_explicit_file_requirement = file_requirement_match is not None
     requires_files = has_file_paths or has_explicit_file_requirement
     if has_explicit_file_requirement and not has_file_paths:
-        signal("constraint", "requires_files", True, 0.72, "请求显式引用文件、项目或附件")
+        signal(
+            "constraint",
+            "requires_files",
+            True,
+            0.72,
+            "请求显式引用文件、项目或附件",
+            match=file_requirement_match,
+            rule_id="constraint:requires_files",
+            negated=_is_negated(normalized, file_requirement_match.span()),
+            quoted=_is_quoted(normalized, file_requirement_match.span()),
+        )
 
     explicit_execute = intent_scores.get("execute", 0.0) >= 0.65
     requires_tools = explicit_execute or bool(
         _search(_TOOL_REQUIREMENT_RE, normalized)
     ) and any(item in intent_scores for item in ("create", "modify", "debug", "execute"))
     if requires_tools:
-        signal("constraint", "requires_tools", True, 0.82, "请求包含执行、部署或线上操作语义")
+        tool_match = _search(_TOOL_REQUIREMENT_RE, normalized)
+        signal(
+            "constraint",
+            "requires_tools",
+            True,
+            0.82,
+            "请求包含执行、部署或线上操作语义",
+            match=tool_match,
+            rule_id="constraint:requires_tools",
+            negated=_is_negated(normalized, tool_match.span()) if tool_match else False,
+            quoted=_is_quoted(normalized, tool_match.span()) if tool_match else False,
+        )
 
     risk_reasons: list[str] = []
     for reason, pattern in _RISK_RULES:
         match = _search(pattern, normalized)
         if match:
-            risk_reasons.append(reason)
-            signal("risk", reason, _short_value(match.group(0)), 0.9, "发现可能影响外部系统或数据的操作")
+            negated = _is_negated(normalized, match.span())
+            quoted = _is_quoted(normalized, match.span())
+            if not negated and not quoted:
+                risk_reasons.append(reason)
+            signal(
+                "risk",
+                reason,
+                _short_value(match.group(0)),
+                0.9,
+                "发现可能影响外部系统或数据的操作",
+                match=match,
+                rule_id=f"risk:{reason}",
+                negated=negated,
+                quoted=quoted,
+            )
 
     constraints = TaskConstraints(
         requires_files=requires_files,
@@ -241,11 +380,11 @@ _RISK_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
 )
 
 
-def _detect_language(text: str) -> tuple[str | None, float, str | None]:
+def _detect_language(text: str) -> tuple[str | None, float, re.Match[str] | None]:
     for language, pattern, strength in _LANGUAGE_RULES:
         match = _search(pattern, text)
         if match:
-            return language, strength, match.group(0)
+            return language, strength, match
     return None, 0.0, None
 
 
@@ -255,11 +394,70 @@ def _score_domains_from_terms(text: str, scores: dict[str, float], signal) -> No
         if not match:
             continue
         scores[domain] = max(scores.get(domain, 0.0), strength)
-        signal("domain_hint", domain, _short_value(match.group(0)), strength, "发现领域术语")
+        signal(
+            "domain_hint",
+            domain,
+            _short_value(match.group(0)),
+            strength,
+            "发现领域术语",
+            match=match,
+            rule_id=f"domain:{domain}",
+            negated=_is_negated(text, match.span()),
+            quoted=_is_quoted(text, match.span()),
+        )
 
 
 def _search(pattern: re.Pattern[str], text: str) -> re.Match[str] | None:
     return pattern.search(text)
+
+
+def _normalize_with_spans(text: str) -> tuple[str, tuple[tuple[int, int], ...]]:
+    """Normalize text while retaining a map back to original offsets."""
+
+    normalized_parts: list[str] = []
+    spans: list[tuple[int, int]] = []
+    for index, character in enumerate(text):
+        normalized = unicodedata.normalize("NFKC", character).casefold()
+        normalized_parts.append(normalized)
+        spans.extend((index, index + 1) for _ in normalized)
+    return "".join(normalized_parts), tuple(spans)
+
+
+def _span_to_original(
+    span: tuple[int, int],
+    normalized_spans: tuple[tuple[int, int], ...],
+) -> tuple[int, int] | None:
+    start, end = span
+    if start < 0 or end > len(normalized_spans) or start >= end:
+        return None
+    return normalized_spans[start][0], normalized_spans[end - 1][1]
+
+
+def _is_quoted(text: str, span: tuple[int, int]) -> bool:
+    """Return whether a match is enclosed by common quote/code delimiters."""
+
+    start, end = span
+    before = text[max(0, start - 96):start]
+    after = text[end:min(len(text), end + 96)]
+    for left, right in (("`", "`"), ('"', '"'), ("'", "'"), ("“", "”"), ("「", "」"), ("『", "』")):
+        if left == right:
+            if before.count(left) % 2 == 1 and right in after:
+                return True
+            continue
+        if before.rfind(left) > before.rfind(right) and right in after:
+            return True
+    return False
+
+
+def _is_negated(text: str, span: tuple[int, int]) -> bool:
+    """Return whether a nearby negation scopes over a matched signal."""
+
+    start, _ = span
+    prefix = text[max(0, start - 48):start]
+    return bool(
+        re.search(r"(?:不要|别|勿|禁止|不许|不可|不能|无需|不必|没必要|拒绝).{0,64}$", prefix)
+        or re.search(r"(?:do\s+not|don't|never|not|without).{0,64}$", prefix, re.I)
+    )
 
 
 def _short_value(value: str, limit: int = 80) -> str:

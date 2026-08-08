@@ -171,7 +171,20 @@
         "label": {"type": "string"},
         "value": {"type": ["string", "boolean", "number"]},
         "strength": {"$ref": "#/$defs/probability"},
-        "detail": {"type": "string"}
+        "detail": {"type": "string"},
+        "source_span": {
+          "type": ["array", "null"],
+          "prefixItems": [
+            {"type": "integer", "minimum": 0},
+            {"type": "integer", "minimum": 0}
+          ],
+          "items": false,
+          "minItems": 2,
+          "maxItems": 2
+        },
+        "rule_id": {"type": "string"},
+        "negated": {"type": "boolean"},
+        "quoted": {"type": "boolean"}
       },
       "additionalProperties": true
     },

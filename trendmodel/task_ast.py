@@ -2,7 +2,7 @@
 
 ``TaskAST`` is intentionally not a programming-language syntax tree.  It is
 the normalized, router-oriented representation of facts and candidate scores
-that can be extracted from a prompt before semantic probabilities are fused.
+that can be extracted from a prompt before the model heads make a decision.
 The class gives the extractor, TensorFlow feature branch and prototype tagger
 one explicit contract instead of passing a collection of loosely related
 fields around.
@@ -11,6 +11,7 @@ fields around.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Any, ClassVar, Mapping
 
 from .task_ir import TaskConstraints, TaskEvidence
@@ -23,7 +24,9 @@ class TaskAST:
     The score mappings contain bounded candidate evidence, not final labels.
     A request may therefore have multiple non-zero intent/domain/artifact
     candidates.  Final selection remains the responsibility of the semantic
-    model, fusion policy and safety/clarification rules.
+    model and safety/clarification rules.  ``TaskEvidence`` items retain
+    provenance so a downstream router can distinguish active, negated and
+    quoted signals.
     """
 
     original_prompt: str
@@ -46,6 +49,7 @@ class TaskAST:
         if not isinstance(self.original_prompt, str) or not self.original_prompt.strip():
             raise ValueError("original_prompt must not be empty")
         for field_name, scores in self._score_fields():
+            normalized_scores: dict[str, float] = {}
             for label, value in scores.items():
                 try:
                     numeric = float(value)
@@ -57,6 +61,11 @@ class TaskAST:
                     raise ValueError(
                         f"{field_name}[{label!r}] must be between 0 and 1"
                     )
+                normalized_scores[str(label)] = numeric
+            object.__setattr__(self, field_name, MappingProxyType(normalized_scores))
+        object.__setattr__(self, "operations", tuple(self.operations))
+        object.__setattr__(self, "signals", tuple(self.signals))
+        object.__setattr__(self, "risk_reasons", tuple(self.risk_reasons))
         if any(not str(operation).strip() for operation in self.operations):
             raise ValueError("operations must contain non-empty labels")
         if any(not str(reason).strip() for reason in self.risk_reasons):
