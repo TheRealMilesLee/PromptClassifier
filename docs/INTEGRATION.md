@@ -2,7 +2,7 @@
 
 本文档是另一个项目接入 TrendModel 的主入口。TrendModel 只负责把用户 prompt 转换成路由标签和不确定性信息，不负责生成最终答案、选择具体供应商模型或执行工具。
 
-当前推荐 artifact：`trendmodel-text-v1`，模型版本：`0.1.1`。
+当前推荐 artifact：`trendmodel-text-v1`。重新训练后模型版本为 `0.3.0`，它包含 structured feature branch、受控类别重加权和 `effort_bucket` 分类头；已有 text-only artifact 仍可被兼容加载。
 
 ## 1. 选择接入方式
 
@@ -266,8 +266,9 @@ complexity:
   "bucket": "M",
   "estimated_minutes": 75,
   "range_minutes": [45, 120],
+  "probability": 0.62,
   "confidence": 0.19,
-  "basis": "bucket_seed_only"
+  "basis": "trained_effort_bucket_head"
 }
 ```
 
@@ -281,9 +282,9 @@ complexity:
 | `L` | 120–480 分钟 |
 | `XL` | 1,440–4,320 分钟 |
 
-当前 artifact 的 `observed_effort_samples=0`，所以 `basis` 是 `bucket_seed_only`。这表示模型只学到了极粗的 bucket 先验，没有真实 active minutes 监督。下游应优先使用 `bucket` 做排序，不应把 `estimated_minutes` 当成承诺工时。
+当前 artifact 的 `observed_effort_samples=0`，所以即使有 `effort_bucket` 分类头，`basis` 也只能是 `trained_effort_bucket_head` 或旧 artifact 的 `bucket_seed_only`。这表示模型只学到了极粗的 bucket 先验，没有真实 active minutes 监督。下游应优先使用 `bucket` 做排序，不应把 `estimated_minutes` 当成承诺工时。
 
-未来加入真实耗时后，basis 会变成 `trained_observed_effort_head`；如果完全没有 effort supervision，basis 会是 `no_effort_supervision`，分钟数为 `null`。
+未来加入真实耗时后，basis 会变成 `trained_observed_effort_and_bucket_heads`；如果完全没有 effort supervision，basis 会是 `no_effort_supervision`，分钟数为 `null`。
 
 ### `confidence`
 
@@ -297,12 +298,13 @@ complexity:
 }
 ```
 
-这些值是路由不确定性信号，不是校准后的准确率。特别是：
+这些值是路由不确定性信号，不是校准后的准确率。每个 `predictions.*` head 还会返回 `entropy` 和 `margin`：前者是归一化分布熵，越高越不确定；后者是 top-1 与 top-2 概率差，越低越容易混淆。特别是：
 
 - `workload_type`、`intent`、`complexity` 通常是对应 head 的最大 posterior；
 - `effort` 受监督数据质量影响，当前应明显低权重；
 - `overall` 是多个 head 的加权汇总，不是独立概率事件；
 - 低 confidence 应触发便宜模型 fallback、用户确认或保守路由。
+- `entropy`/`margin` 只能作为排序和拒识信号；在独立 gold 集准备好之前，不要把它们当作经过 calibration 的概率。
 
 ### `evidence`
 
@@ -443,7 +445,7 @@ artifacts/trendmodel-text-v1/
 1. `metadata.model_id` 是否为预期模型；
 2. `metadata.model_version` 是否在兼容范围内；
 3. `metadata.labels` 是否包含下游支持的 label；
-4. `metadata.effort_supervision_samples` 和 `observed_effort_samples` 是否满足要求；
+4. `metadata.effort_bucket_supervision_samples`、`effort_minutes_supervision_samples`、`effort_supervision_samples` 和 `observed_effort_samples` 是否满足要求；
 5. 模型文件 checksum 是否与发布清单一致。
 
 原始数据、清洗数据、模型 artifact 和 Python 虚拟环境都被 `.gitignore` 忽略，不应通过 Git 传递。建议使用内部 artifact storage、受控文件复制或带 checksum 的压缩包。

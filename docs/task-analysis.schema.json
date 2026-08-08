@@ -93,6 +93,8 @@
       "properties": {
         "label": {"type": "string"},
         "probability": {"$ref": "#/$defs/probability"},
+        "entropy": {"$ref": "#/$defs/probability"},
+        "margin": {"$ref": "#/$defs/probability"},
         "candidates": {
           "type": "array",
           "items": {
@@ -113,6 +115,21 @@
       "required": ["label", "estimated_minutes", "range_minutes", "confidence", "basis"],
       "properties": {
         "label": {"type": "string", "enum": ["XS", "S", "M", "L", "XL", "unknown"]},
+        "probability": {"$ref": "#/$defs/probability"},
+        "entropy": {"$ref": "#/$defs/probability"},
+        "margin": {"$ref": "#/$defs/probability"},
+        "candidates": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["label", "probability"],
+            "properties": {
+              "label": {"type": "string", "enum": ["XS", "S", "M", "L", "XL"]},
+              "probability": {"$ref": "#/$defs/probability"}
+            },
+            "additionalProperties": true
+          }
+        },
         "estimated_minutes": {"type": ["integer", "null"], "minimum": 1},
         "range_minutes": {
           "type": ["array", "null"],
@@ -127,7 +144,13 @@
         "confidence": {"$ref": "#/$defs/probability"},
         "basis": {
           "type": "string",
-          "enum": ["bucket_seed_only", "trained_observed_effort_head", "no_effort_supervision"]
+          "enum": [
+            "bucket_seed_only",
+            "trained_effort_bucket_head",
+            "trained_observed_effort_head",
+            "trained_observed_effort_and_bucket_heads",
+            "no_effort_supervision"
+          ]
         }
       },
       "additionalProperties": true

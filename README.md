@@ -17,7 +17,7 @@ TrendModel 是给 Auto Router 使用的轻量级 prompt 标签模型。它只负
 - 机器可读的 [task-analysis.schema.json](docs/task-analysis.schema.json)；
 - artifact 版本、Metal/CUDA/CPU 行为和 Router fallback 建议。
 
-训练产物位于本机 `artifacts/trendmodel-text-v1/`，不提交到 Git。下游只需要复制整个 artifact 目录以及兼容的 Python/TensorFlow runtime。
+训练产物位于本机 `artifacts/trendmodel-text-v1/`，不提交到 Git。下游只需要复制整个 artifact 目录以及兼容的 Python/TensorFlow runtime。公共数据集的筛选、许可证和本机 adapter 见 [数据集说明](docs/DATASETS.md)。
 
 ## 当前架构
 
@@ -66,7 +66,7 @@ result = tagger.predict(
 payload = result.to_dict()
 ```
 
-输出包含这些核心字段：
+输出包含这些核心字段；`predictions.*` 还提供 `entropy` 和 `margin`，便于 router 识别多个候选接近的请求：
 
 ```json
 {
@@ -147,10 +147,11 @@ reasoning / coding / context / tool_use
 
 ## 数据和训练边界
 
-公共数据可以提供 prompt 分布、语言变化和部分弱标签，但不能凭空产生 effort 真值。当前本地训练快照使用两套数据：
+公共数据可以提供 prompt 分布、语言变化和部分弱标签，但不能凭空产生 effort 真值。当前推荐的数据组合、许可证和本地下载方式见 [数据集说明](docs/DATASETS.md)。第一轮可以从下面的受控混合开始：
 
-- WildChat-4.8M：广泛 prompt 分布；
-- Arena Human Preference 140k：`is_code`、`category_tag` 和偏好辅助信号。
+- WildChat/Arena：广泛 prompt 分布和代码弱信号；
+- Code-Feedback、xLAM、SWE-bench：代码创建、工具执行和代码修改；
+- MASSIVE、MTOP、COIG：中文/多语言短指令和表达覆盖。
 
 LMSYS-Chat-1M 的兼容读取代码仍保留，但本项目当前不下载、不清洗、不训练它。
 
@@ -227,7 +228,7 @@ python3 -m trendmodel.tf_train predict \
   "帮我实现一个 C++ 多线程程序"
 ```
 
-模型是 `TextVectorization(character) + Embedding + BiGRU + multi-task heads`，同时预测 workload、intent、complexity、effort 和是否需要澄清。缺失字段通过 sample weight mask；公共数据可以训练分类头，但没有 effort supervision 时不会伪造 effort 数字。保存的 artifact 包括 `model.keras` 和 `metadata.json`，推理 JSON 在保留旧 scalar 字段的同时，新增 `predictions` 概率结构，方便 router 使用候选和置信度。
+模型是 `TextVectorization(character) + Embedding + BiGRU + character n-gram TF-IDF branch + structured feature branch + multi-task heads`，同时预测 workload、intent、complexity、effort bucket、effort minutes 和是否需要澄清。训练时对稀有类别使用 capped inverse-sqrt sample weighting，避免 `low` 或多数 workload 把 head 吸成单一类别；可信的人工/种子标签默认通过 `--gold-replay-multiplier 8` 做训练 replay，避免公共 weak/pseudo 数据淹没内部 gold。结构分支显式接收代码块、文件、Shell、语言、工具/执行和风险等确定性信号；它与推理时的 evidence fusion 使用同一套 extractor。缺失字段通过 sample weight mask；公共数据可以训练分类头，但没有真实 effort supervision 时不会伪造分钟真值。保存的 artifact 包括 `model.keras` 和 `metadata.json`，推理 JSON 在保留旧 scalar 字段的同时，新增 `predictions` 概率结构和 effort bucket candidates，方便 router 使用候选和置信度。旧的 text-only artifact 仍可加载，新训练产物使用模型版本 `0.3.0`。
 
 当前仓库的默认解释器是 Python 3.14。它可以运行清洗、TaskTagger 和 Hugging Face `datasets` 4/5 系列，但仓库固定的 TensorFlow 2.16.2 没有 Python 3.14 wheel。本机真正训练需要单独准备 Python 3.11/3.12 环境，再按硬件安装对应 runtime；这不是代码训练失败，而是运行时 wheel 约束。
 

@@ -170,7 +170,11 @@ def build_parser() -> argparse.ArgumentParser:
     prepare.add_argument(
         "--sources",
         default="",
-        help="optional comma-separated Hugging Face sources: wildchat,lmsys,arena",
+        help=(
+            "optional comma-separated Hugging Face sources: wildchat,lmsys,arena,"
+            "xlam,swebench,swe_trajectories,massive,oasst1,code_feedback,coig,dolly"
+            ",mtop,helpful_instructions"
+        ),
     )
     prepare.add_argument(
         "--local-raw-dir",
@@ -179,11 +183,55 @@ def build_parser() -> argparse.ArgumentParser:
     prepare.add_argument(
         "--local-sources",
         default="wildchat,arena",
-        help="comma-separated local source folders under --local-raw-dir (add lmsys after approval)",
+        help=(
+            "comma-separated local source folders under --local-raw-dir; "
+            "supported: wildchat,arena,xlam,swebench,swe_trajectories,massive,"
+            "oasst1,code_feedback,coig,dolly,mtop,helpful_instructions"
+        ),
     )
     prepare.add_argument("--wildchat-limit", type=int, default=50_000, help="0 skips; -1 reads all local rows")
     prepare.add_argument("--lmsys-limit", type=int, default=50_000, help="0 skips; -1 reads all local rows")
     prepare.add_argument("--arena-limit", type=int, default=20_000, help="0 skips; -1 reads all local rows")
+    prepare.add_argument("--xlam-limit", type=int, default=0, help="0 skips; -1 reads all local rows")
+    prepare.add_argument("--swebench-limit", type=int, default=0, help="0 skips; -1 reads all local rows")
+    prepare.add_argument(
+        "--swe-trajectories-limit",
+        type=int,
+        default=0,
+        help="0 skips; -1 reads all local rows",
+    )
+    prepare.add_argument("--massive-limit", type=int, default=0, help="0 skips; -1 reads all local rows")
+    prepare.add_argument("--oasst1-limit", type=int, default=0, help="0 skips; -1 reads all local rows")
+    prepare.add_argument(
+        "--code-feedback-limit",
+        type=int,
+        default=0,
+        help="0 skips; -1 reads all local rows",
+    )
+    prepare.add_argument(
+        "--coig-limit",
+        type=int,
+        default=0,
+        help="0 skips; -1 reads all local rows",
+    )
+    prepare.add_argument(
+        "--dolly-limit",
+        type=int,
+        default=0,
+        help="0 skips; -1 reads all local rows",
+    )
+    prepare.add_argument(
+        "--mtop-limit",
+        type=int,
+        default=0,
+        help="0 skips; -1 reads all local rows",
+    )
+    prepare.add_argument(
+        "--helpful-instructions-limit",
+        type=int,
+        default=0,
+        help="0 skips; -1 reads all local rows",
+    )
     prepare.add_argument("--languages", default="en,zh")
     prepare.add_argument("--split", default="train")
     prepare.add_argument("--seed", type=int, default=42)
@@ -210,6 +258,12 @@ def build_parser() -> argparse.ArgumentParser:
     train.add_argument("--batch-size", type=int, default=16)
     train.add_argument("--validation-ratio", type=float, default=0.2)
     train.add_argument("--seed", type=int, default=42)
+    train.add_argument(
+        "--gold-replay-multiplier",
+        type=float,
+        default=8.0,
+        help="multiply trusted manual/gold/seed labels during training so weak public data cannot drown them",
+    )
     train.add_argument(
         "--require-gpu",
         action="store_true",
@@ -247,6 +301,16 @@ def main(argv: list[str] | None = None) -> int:
             "wildchat": args.wildchat_limit,
             "lmsys": args.lmsys_limit,
             "arena": args.arena_limit,
+            "xlam": args.xlam_limit,
+            "swebench": args.swebench_limit,
+            "swe_trajectories": args.swe_trajectories_limit,
+            "massive": args.massive_limit,
+            "oasst1": args.oasst1_limit,
+            "code_feedback": args.code_feedback_limit,
+            "coig": args.coig_limit,
+            "dolly": args.dolly_limit,
+            "mtop": args.mtop_limit,
+            "helpful_instructions": args.helpful_instructions_limit,
         }
         report = prepare_training_data(
             input_paths=args.input,
@@ -283,6 +347,7 @@ def main(argv: list[str] | None = None) -> int:
             validation_ratio=args.validation_ratio,
             seed=args.seed,
             require_gpu=args.require_gpu,
+            gold_replay_multiplier=args.gold_replay_multiplier,
         )
         print(json.dumps(metadata, ensure_ascii=False, indent=2))
         return 0

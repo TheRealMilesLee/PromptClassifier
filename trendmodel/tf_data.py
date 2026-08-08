@@ -15,6 +15,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
+from .tf_features import structured_feature_matrix
+
 
 WORKLOAD_LABEL_ORDER = ("text", "code", "analysis", "operations", "planning", "mixed", "other")
 INTENT_LABEL_ORDER = (
@@ -75,9 +77,31 @@ class TaskRecord:
 
     @property
     def effort_supervised(self) -> bool:
-        """Whether an effort target exists, including an explicit bucket label."""
+        """Whether any effort target exists, including an explicit bucket label.
+
+        This property intentionally includes bucket-only records for callers
+        that need to know whether the coarse effort head has a target.  Use
+        :attr:`effort_minutes_supervised` for the numeric regression head.
+        """
 
         return self.effort_minutes is not None and self.effort_bucket is not None
+
+    @property
+    def effort_minutes_supervised(self) -> bool:
+        """Whether observed active minutes may supervise numeric effort.
+
+        Bucket-only records retain a midpoint in ``effort_minutes`` for
+        backwards-compatible serialization, but that midpoint is not a real
+        observation and must never train or evaluate the minute regressor.
+        """
+
+        return bool(self.observed_effort and self.effort_minutes is not None)
+
+    @property
+    def effort_bucket_supervised(self) -> bool:
+        """Whether the coarse effort bucket can supervise its classification head."""
+
+        return self.effort_bucket is not None
 
     def supervision_weight(self, field: str) -> float:
         """Return a conservative sample weight for one label head.
@@ -90,7 +114,9 @@ class TaskRecord:
         """
 
         if field == "effort_log_minutes":
-            return 1.0 if self.effort_supervised else 0.0
+            return 1.0 if self.effort_minutes_supervised else 0.0
+        if field == "effort_bucket":
+            return 1.0 if self.effort_bucket_supervised else 0.0
         if field == "needs_clarification":
             if self.needs_clarification is None:
                 return 0.0
@@ -215,12 +241,14 @@ class LabelMaps:
     workload_type: tuple[str, ...]
     intent: tuple[str, ...]
     complexity: tuple[str, ...] = COMPLEXITY_LABEL_ORDER
+    effort_bucket: tuple[str, ...] = EFFORT_BUCKET_ORDER
 
     def to_dict(self) -> dict[str, list[str]]:
         return {
             "workload_type": list(self.workload_type),
             "intent": list(self.intent),
             "complexity": list(self.complexity),
+            "effort_bucket": list(self.effort_bucket),
         }
 
     @classmethod
@@ -229,6 +257,7 @@ class LabelMaps:
             workload_type=tuple(str(item) for item in value["workload_type"]),
             intent=tuple(str(item) for item in value["intent"]),
             complexity=tuple(str(item) for item in value.get("complexity", COMPLEXITY_LABEL_ORDER)),
+            effort_bucket=tuple(str(item) for item in value.get("effort_bucket", EFFORT_BUCKET_ORDER)),
         )
 
 
@@ -260,6 +289,64 @@ def build_label_maps(records: Iterable[TaskRecord]) -> LabelMaps:
             INTENT_LABEL_ORDER,
         ),
     )
+
+
+def label_balance_weights(
+    records: Iterable[TaskRecord],
+    label_maps: LabelMaps,
+    *,
+    maximum: float = 3.0,
+) -> dict[str, dict[str, float]]:
+    """Return capped inverse-sqrt weights for the supervised label heads.
+
+    Public weak labels are usually highly skewed (for example, ``low``
+    complexity dominates and ``high`` is rare).  A plain cross-entropy loss
+    can therefore learn the majority class while still looking reasonable on
+    aggregate accuracy.  Inverse *square-root* frequency is deliberately
+    milder than full inverse frequency: it gives rare classes more gradient
+    without allowing a handful of noisy weak labels to dominate training.
+
+    Only labels that actually occur in the supplied records receive a weight.
+    The returned values are metadata-friendly and are applied to training
+    sample weights by :func:`make_dataset`.
+    """
+
+    if maximum < 1.0:
+        raise ValueError("maximum balance weight must be at least 1")
+    records = list(records)
+    fields = {
+        "workload_type": label_maps.workload_type,
+        "intent": label_maps.intent,
+        "complexity": label_maps.complexity,
+        "effort_bucket": label_maps.effort_bucket,
+    }
+    result: dict[str, dict[str, float]] = {}
+    for field, labels in fields.items():
+        counts = {
+            label: sum(
+                max(0.0, float(record.supervision_weight(field)))
+                for record in records
+                if getattr(record, field) == label
+            )
+            for label in labels
+        }
+        active = {label: count for label, count in counts.items() if count > 0.0}
+        if not active:
+            result[field] = {}
+            continue
+        total = sum(active.values())
+        raw = {
+            label: math.sqrt(total / (len(active) * count))
+            for label, count in active.items()
+        }
+        clipped = {label: min(maximum, max(1.0 / maximum, value)) for label, value in raw.items()}
+        # Keep the average gradient scale close to one after clipping.
+        normalizer = total / sum(active[label] * clipped[label] for label in active)
+        result[field] = {
+            label: round(min(maximum, max(1.0 / maximum, value * normalizer)), 6)
+            for label, value in clipped.items()
+        }
+    return result
 
 
 def split_records(
@@ -318,8 +405,14 @@ def make_dataset(
     *,
     batch_size: int = 16,
     shuffle: bool = False,
+    balance_labels: bool = False,
+    gold_replay_multiplier: float = 1.0,
+    seed: int = 42,
 ):
     """Create a tf.data.Dataset without importing TensorFlow at module load time."""
+
+    if gold_replay_multiplier < 1.0:
+        raise ValueError("gold_replay_multiplier must be at least 1")
 
     try:
         import tensorflow as tf
@@ -333,8 +426,14 @@ def make_dataset(
     workload_index = {label: index for index, label in enumerate(label_maps.workload_type)}
     intent_index = {label: index for index, label in enumerate(label_maps.intent)}
     complexity_index = {label: index for index, label in enumerate(label_maps.complexity)}
+    effort_bucket_index = {label: index for index, label in enumerate(label_maps.effort_bucket)}
+    balance_weights = label_balance_weights(records, label_maps) if balance_labels else {}
 
-    def indexed_labels(records: list[TaskRecord], field: str, index: Mapping[str, int]) -> tuple[list[int], list[float]]:
+    def indexed_labels(
+        records: list[TaskRecord],
+        field: str,
+        index: Mapping[str, int],
+    ) -> tuple[list[int], list[float]]:
         values: list[int] = []
         masks: list[float] = []
         for record in records:
@@ -346,17 +445,33 @@ def make_dataset(
             if label not in index:
                 raise ValueError(f"label {label!r} for {field} is not present in label maps")
             values.append(index[label])
-            masks.append(record.supervision_weight(field))
+            mask = replay_supervision_weight(
+                record,
+                field,
+                multiplier=gold_replay_multiplier,
+            )
+            if balance_weights:
+                mask *= balance_weights.get(field, {}).get(label, 1.0)
+            masks.append(mask)
         return values, masks
 
     texts = [normalize_model_text(record.original_prompt) for record in records]
+    structured_features = structured_feature_matrix(
+        record.original_prompt for record in records
+    )
     workload_values, workload_masks = indexed_labels(records, "workload_type", workload_index)
     intent_values, intent_masks = indexed_labels(records, "intent", intent_index)
     complexity_values, complexity_masks = indexed_labels(records, "complexity", complexity_index)
+    effort_bucket_values, effort_bucket_masks = indexed_labels(
+        records,
+        "effort_bucket",
+        effort_bucket_index,
+    )
     targets = {
         "workload_type": workload_values,
         "intent": intent_values,
         "complexity": complexity_values,
+        "effort_bucket": effort_bucket_values,
         "effort_log_minutes": [
             math.log1p(record.effort_minutes) if record.effort_minutes is not None else 0.0
             for record in records
@@ -370,15 +485,56 @@ def make_dataset(
         "workload_type": workload_masks,
         "intent": intent_masks,
         "complexity": complexity_masks,
-        "effort_log_minutes": [record.supervision_weight("effort_log_minutes") for record in records],
+        "effort_bucket": effort_bucket_masks,
+        "effort_log_minutes": [
+            replay_supervision_weight(
+                record,
+                "effort_log_minutes",
+                multiplier=gold_replay_multiplier,
+            )
+            for record in records
+        ],
         "needs_clarification": [
-            record.supervision_weight("needs_clarification") for record in records
+            replay_supervision_weight(
+                record,
+                "needs_clarification",
+                multiplier=gold_replay_multiplier,
+            )
+            for record in records
         ],
     }
-    dataset = tf.data.Dataset.from_tensor_slices((texts, targets, sample_weights))
+    inputs = {
+        "original_prompt": texts,
+        "structured_features": structured_features,
+    }
+    dataset = tf.data.Dataset.from_tensor_slices((inputs, targets, sample_weights))
     if shuffle:
-        dataset = dataset.shuffle(max(len(records), 1), seed=42, reshuffle_each_iteration=True)
+        dataset = dataset.shuffle(max(len(records), 1), seed=seed, reshuffle_each_iteration=True)
     return dataset.batch(batch_size).prefetch(tf.data.AUTOTUNE)
+
+
+def replay_supervision_weight(
+    record: TaskRecord,
+    field: str,
+    *,
+    multiplier: float = 1.0,
+) -> float:
+    """Weight trusted labels so a large weak corpus cannot drown gold data.
+
+    Public corpora are useful for coverage but are normally weak or teacher
+    labelled.  A small internal gold set should therefore be replayed more
+    often during training.  This affects only the training sample weight; it
+    does not duplicate rows or alter validation metrics.
+    """
+
+    if multiplier < 1.0:
+        raise ValueError("gold replay multiplier must be at least 1")
+    base = record.supervision_weight(field)
+    if base <= 0.0:
+        return 0.0
+    source = str(record.label_source).casefold()
+    trusted = any(marker in source for marker in ("manual", "gold", "seed", "observed"))
+    return base * multiplier if trusted else base
 
 
 def bucket_from_minutes(minutes: float) -> str:

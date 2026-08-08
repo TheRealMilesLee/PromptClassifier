@@ -84,12 +84,17 @@ Gold 集应与训练数据分开保存，评估时使用 validation split 或完
 
 ## 公共 prompt 语料
 
-当前本地训练快照使用两套 Hugging Face 数据集：
+当前已接入的候选公共数据集、标签边界、许可证核验和本机下载方式见
+[docs/DATASETS.md](../docs/DATASETS.md)。第一批优先补工具调用、代码修改和中文短指令；不要把所有聊天语料无差别合并。
+
+当前本地训练快照建议使用受控的数据混合；具体数据集、许可证和下载命令见
+[docs/DATASETS.md](../docs/DATASETS.md)：
 
 | 数据集 | 主要用途 | 不能直接当作 |
 | --- | --- | --- |
-| [WildChat-4.8M](https://huggingface.co/datasets/allenai/WildChat-4.8M) | 广泛的真实 prompt 分布、语言和任务表达 | effort 真值 |
-| [Arena Human Preference 140k](https://huggingface.co/datasets/lmarena-ai/arena-human-preference-140k) | `is_code`、`category_tag` 和偏好分析辅助信号 | `winner` 对应的任务 effort |
+| WildChat/Arena | 广泛 prompt 分布、代码弱信号和困难表达 | effort 真值 |
+| Code-Feedback/xLAM/SWE-bench | 代码创建、工具执行和代码修改 | 人类 active minutes |
+| MASSIVE/MTOP/COIG | 中文/多语言短指令和表达覆盖 | 通用 workload gold |
 
 LMSYS-Chat-1M 的适配代码仍保留作兼容，但当前项目明确不下载、不清洗、不训练该数据集。
 
@@ -128,7 +133,7 @@ python -m trendmodel.train prepare \
 python -m pip install -r requirements-data.txt
 ```
 
-当前只从本地下载的 WildChat 和 Arena 生成训练数据；入口只导出每条 conversation 的第一个 user prompt：
+入口只从本地落盘的数据生成训练记录，并按 source adapter 导出每条 conversation 或任务中的 prompt：
 
 ```bash
 python -m trendmodel.train prepare \
@@ -152,4 +157,4 @@ python -m trendmodel.train prepare \
   --report data/processed/cleaning_report.json
 ```
 
-伪标签的 `label_source` 会被标记为 `task_tagger_pseudo`，不能用于最终评估。旧的 `trendmodel.public_data --pseudo-label-data` 入口仍保留用于兼容，但新训练流程不再依赖旧 Naive Bayes baseline。`effort_minutes` 永远不会由公共语料或 teacher 自动填充；真实 effort 只能来自内部任务记录的 active minutes 或人工确认的 bucket。
+伪标签的 `label_source` 会被标记为 `task_tagger_pseudo`，不能用于最终评估。TensorFlow 训练会记录类别平衡权重；它不会凭空生成 `active_minutes`。只有 bucket 的记录可以监督 `effort_bucket`，没有真实 active minutes 时不能证明分钟估计有效。旧的 `trendmodel.public_data --pseudo-label-data` 入口仍保留用于兼容，但新训练流程不再依赖旧 Naive Bayes baseline。

@@ -8,7 +8,13 @@ import re
 from pathlib import Path
 from typing import Any, Mapping
 
-from .tf_data import EFFORT_BUCKET_ORDER, bucket_from_minutes, normalize_model_text
+from .tf_data import (
+    EFFORT_BUCKET_MIDPOINTS,
+    EFFORT_BUCKET_ORDER,
+    bucket_from_minutes,
+    normalize_model_text,
+)
+from .tf_features import structured_feature_matrix
 from .tf_model import require_tensorflow
 from .tagger import TaskTagger
 
@@ -20,7 +26,13 @@ class TensorFlowTaskModel:
         self.workload_labels = list(metadata["labels"]["workload_type"])
         self.intent_labels = list(metadata["labels"]["intent"])
         self.complexity_labels = list(metadata["labels"]["complexity"])
+        self.effort_bucket_labels = list(
+            metadata.get("labels", {}).get("effort_bucket", EFFORT_BUCKET_ORDER)
+        )
         self.model_id = str(metadata.get("model_id", "trendmodel-text-v1"))
+        self.structured_feature_dim = int(metadata.get("structured_feature_dim", 0) or 0)
+        output_names = getattr(model, "output_names", ())
+        self.has_effort_bucket_head = "effort_bucket" in output_names
         # The TensorFlow heads learn the prompt distribution.  This compact,
         # dependency-free teacher contributes only high-confidence structured
         # evidence (language, explicit action, command/file signals, etc.) at
@@ -46,8 +58,7 @@ class TensorFlowTaskModel:
         if not str(prompt).strip():
             raise ValueError("prompt must not be empty")
         prompt = str(prompt)
-        tf = require_tensorflow()
-        raw = self.model.predict(tf.constant([normalize_model_text(prompt)]), verbose=0)
+        raw = self.model.predict(self._model_inputs([prompt]), verbose=0)
 
         workload_probabilities = _probabilities(raw, "workload_type")
         intent_probabilities = _probabilities(raw, "intent")
@@ -86,48 +97,13 @@ class TensorFlowTaskModel:
         workload_confidence = max(workload_probabilities)
         intent_confidence = max(intent_probabilities)
         complexity_confidence = max(complexity_probabilities)
-        effort_available = _effort_head_is_supervised(self.metadata)
-        if effort_available:
-            effort_log_minutes = float(_first_value(raw, "effort_log_minutes"))
-            estimated_minutes = max(1, min(round(math.expm1(effort_log_minutes)), 10_080))
-            effort_bucket = bucket_from_minutes(estimated_minutes)
-            if effort_bucket not in EFFORT_BUCKET_ORDER:
-                effort_bucket = "M"
-            effort_range = _effort_range(effort_bucket)
-            estimated_minutes = max(effort_range[0], min(estimated_minutes, effort_range[1]))
-            if _has_observed_effort_supervision(self.metadata):
-                effort_confidence = min(
-                    0.95,
-                    max(0.25, 0.45 + 0.2 * complexity_confidence - 0.2 * bool(reasons)),
-                )
-                effort_basis = "trained_observed_effort_head"
-            else:
-                # Bucket-only labels teach an ordinal prior, not calibrated
-                # wall-clock minutes.  Keep the estimate useful for ranking,
-                # but make the uncertainty visible to the downstream router.
-                effort_confidence = min(
-                    0.35,
-                    max(0.15, 0.20 + 0.10 * complexity_confidence - 0.10 * bool(reasons)),
-                )
-                effort_basis = "bucket_seed_only"
-            effort_payload = {
-                "label": effort_bucket,
-                "estimated_minutes": estimated_minutes,
-                "range_minutes": effort_range,
-                "confidence": round(effort_confidence, 4),
-                "basis": effort_basis,
-            }
-        else:
-            # A public-only corpus has no effort target.  Returning a number in
-            # that situation would turn missing supervision into fake ground
-            # truth and could make the router choose an unsafe model.
-            effort_payload = {
-                "label": "unknown",
-                "estimated_minutes": None,
-                "range_minutes": None,
-                "confidence": 0.0,
-                "basis": "no_effort_supervision",
-            }
+        effort_payload = _effort_payload_from_raw(
+            raw,
+            complexity_probabilities,
+            self.metadata,
+            effort_bucket_labels=self.effort_bucket_labels,
+            needs_clarification=bool(reasons),
+        )
 
         prediction_payload = {
             "workload_type": _classification_payload(
@@ -218,10 +194,8 @@ class TensorFlowTaskModel:
         if not prompts:
             return []
 
-        tf = require_tensorflow()
-        normalized = [normalize_model_text(str(prompt)) for prompt in prompts]
         raw = self.model.predict(
-            tf.constant(normalized),
+            self._model_inputs([str(prompt) for prompt in prompts]),
             batch_size=batch_size,
             verbose=0,
         )
@@ -233,9 +207,24 @@ class TensorFlowTaskModel:
                 self.intent_labels,
                 self.complexity_labels,
                 self.metadata,
+                effort_bucket_labels=self.effort_bucket_labels,
             )
             for index, prompt in enumerate(prompts)
         ]
+
+    def _model_inputs(self, prompts: list[str]) -> Any:
+        """Build inputs for both new two-branch and legacy text-only artifacts."""
+
+        tf = require_tensorflow()
+        normalized = [normalize_model_text(str(prompt)) for prompt in prompts]
+        text_input = tf.constant(normalized)
+        if self.structured_feature_dim <= 0:
+            return text_input
+        features = structured_feature_matrix(prompts)
+        return {
+            "original_prompt": text_input,
+            "structured_features": tf.constant(features, dtype=tf.float32),
+        }
 
 
 def _probabilities(raw: Any, name: str) -> list[float]:
@@ -251,13 +240,15 @@ def _raw_batch_row(raw: Any, index: int) -> dict[str, Any]:
     """Extract one sample from a batched Keras output mapping."""
 
     row: dict[str, Any] = {}
-    names = (
+    names = [
         "workload_type",
         "intent",
         "complexity",
         "effort_log_minutes",
         "needs_clarification",
-    )
+    ]
+    if isinstance(raw, dict) and "effort_bucket" in raw:
+        names.insert(3, "effort_bucket")
     for name in names:
         value = raw[name] if isinstance(raw, dict) else raw
         if hasattr(value, "numpy"):
@@ -275,6 +266,8 @@ def _raw_prediction_payload(
     intent_labels: list[str],
     complexity_labels: list[str],
     metadata: Mapping[str, Any],
+    *,
+    effort_bucket_labels: list[str] | None = None,
 ) -> dict[str, Any]:
     """Build the evaluation contract from neural outputs only."""
 
@@ -286,38 +279,12 @@ def _raw_prediction_payload(
     complexity = complexity_labels[_argmax(complexity_probabilities)]
     clarification_probability = float(_first_value(raw, "needs_clarification"))
 
-    effort_available = _effort_head_is_supervised(metadata)
-    if effort_available:
-        effort_log_minutes = float(_first_value(raw, "effort_log_minutes"))
-        estimated_minutes = max(1, min(round(math.expm1(effort_log_minutes)), 10_080))
-        effort_bucket = bucket_from_minutes(estimated_minutes)
-        if effort_bucket not in EFFORT_BUCKET_ORDER:
-            effort_bucket = "M"
-        effort_range = _effort_range(effort_bucket)
-        estimated_minutes = max(effort_range[0], min(estimated_minutes, effort_range[1]))
-        effort_confidence = min(
-            0.35,
-            max(0.15, 0.20 + 0.10 * max(complexity_probabilities)),
-        )
-        effort_payload = {
-            "label": effort_bucket,
-            "estimated_minutes": estimated_minutes,
-            "range_minutes": effort_range,
-            "confidence": round(effort_confidence, 4),
-            "basis": (
-                "trained_observed_effort_head"
-                if _has_observed_effort_supervision(metadata)
-                else "bucket_seed_only"
-            ),
-        }
-    else:
-        effort_payload = {
-            "label": "unknown",
-            "estimated_minutes": None,
-            "range_minutes": None,
-            "confidence": 0.0,
-            "basis": "no_effort_supervision",
-        }
+    effort_payload = _effort_payload_from_raw(
+        raw,
+        complexity_probabilities,
+        metadata,
+        effort_bucket_labels=effort_bucket_labels or list(EFFORT_BUCKET_ORDER),
+    )
 
     return {
         "original_prompt": prompt,
@@ -397,16 +364,150 @@ def _classification_payload(
         zip(labels, probabilities),
         key=lambda item: (-item[1], item[0]),
     )[:limit]
+    entropy, margin = _distribution_uncertainty(probabilities)
     return {
         "label": label,
         "probability": round(
             probabilities[labels.index(label)] if label in labels else 0.0,
             4,
         ),
+        # These are uncertainty diagnostics for the router, not calibrated
+        # probabilities.  Calibration requires an independent gold set.
+        "entropy": entropy,
+        "margin": margin,
         "candidates": [
             {"label": candidate, "probability": round(float(probability), 4)}
             for candidate, probability in ranked
         ],
+    }
+
+
+def _distribution_uncertainty(probabilities: list[float]) -> tuple[float, float]:
+    """Return normalized entropy and top-1/top-2 margin for one head."""
+
+    if not probabilities:
+        return 1.0, 0.0
+    bounded = [max(0.0, min(1.0, float(value))) for value in probabilities]
+    total = sum(bounded)
+    if total <= 0.0:
+        return 1.0, 0.0
+    normalized = [value / total for value in bounded]
+    entropy = -sum(value * math.log(value) for value in normalized if value > 0.0)
+    if len(normalized) > 1:
+        entropy /= math.log(len(normalized))
+    ranked = sorted(normalized, reverse=True)
+    margin = ranked[0] - (ranked[1] if len(ranked) > 1 else 0.0)
+    return round(max(0.0, min(1.0, entropy)), 4), round(max(0.0, min(1.0, margin)), 4)
+
+
+def _effort_payload_from_raw(
+    raw: Mapping[str, Any],
+    complexity_probabilities: list[float],
+    metadata: Mapping[str, Any],
+    *,
+    effort_bucket_labels: list[str],
+    needs_clarification: bool = False,
+) -> dict[str, Any]:
+    """Convert effort heads into a coarse, uncertainty-aware router value.
+
+    The bucket head is useful with sparse human annotations because it can
+    learn an ordinal routing prior even when only some tasks have observed
+    minutes.  A numeric estimate is only treated as observed-effort output
+    when the artifact has real active-minute supervision; bucket-only data is
+    reported as a range midpoint with an explicitly weaker basis.
+    """
+
+    has_bucket_head = "effort_bucket" in raw
+    effort_available = _effort_head_is_supervised(metadata)
+    if not effort_available and not has_bucket_head:
+        return {
+            "label": "unknown",
+            "probability": 0.0,
+            "candidates": [],
+            "entropy": 1.0,
+            "margin": 0.0,
+            "estimated_minutes": None,
+            "range_minutes": None,
+            "confidence": 0.0,
+            "basis": "no_effort_supervision",
+        }
+
+    bucket_probabilities: list[float]
+    if has_bucket_head:
+        bucket_probabilities = _probabilities(raw, "effort_bucket")
+        effort_bucket = effort_bucket_labels[_argmax(bucket_probabilities)]
+        bucket_probability = max(bucket_probabilities)
+        bucket_candidates = _classification_payload(
+            effort_bucket,
+            bucket_probabilities,
+            effort_bucket_labels,
+        )
+    else:
+        bucket_probabilities = []
+        effort_log_minutes = float(_first_value(raw, "effort_log_minutes"))
+        estimated_from_regression = max(
+            1,
+            min(round(math.expm1(effort_log_minutes)), 10_080),
+        )
+        effort_bucket = bucket_from_minutes(estimated_from_regression)
+        if effort_bucket not in EFFORT_BUCKET_ORDER:
+            effort_bucket = "M"
+        bucket_probability = 0.0
+        bucket_candidates = {
+            "label": effort_bucket,
+            "probability": 0.0,
+            "candidates": [],
+            "entropy": 1.0,
+            "margin": 0.0,
+        }
+
+    effort_range = _effort_range(effort_bucket)
+    has_observed_effort = _has_observed_effort_supervision(metadata)
+    if has_observed_effort:
+        effort_log_minutes = float(_first_value(raw, "effort_log_minutes"))
+        estimated_minutes = max(1, min(round(math.expm1(effort_log_minutes)), 10_080))
+        estimated_minutes = max(effort_range[0], min(estimated_minutes, effort_range[1]))
+        effort_confidence = min(
+            0.95,
+            max(
+                0.25,
+                0.45
+                + 0.2 * max(complexity_probabilities)
+                + 0.15 * bucket_probability
+                - 0.2 * bool(needs_clarification),
+            ),
+        )
+        effort_basis = (
+            "trained_observed_effort_and_bucket_heads"
+            if has_bucket_head
+            else "trained_observed_effort_head"
+        )
+    else:
+        # There is no honest minute estimate from public prompts or bucket-only
+        # labels.  A midpoint is retained solely to make range-based routing
+        # convenient, and the basis/confidence expose its limitation.
+        estimated_minutes = round(EFFORT_BUCKET_MIDPOINTS.get(effort_bucket, 90.0))
+        effort_confidence = min(
+            0.35 if not has_bucket_head else 0.45,
+            max(
+                0.15,
+                (0.20 + 0.10 * max(complexity_probabilities))
+                if not has_bucket_head
+                else 0.15 + 0.35 * bucket_probability,
+            ),
+        )
+        effort_basis = "trained_effort_bucket_head" if has_bucket_head else "bucket_seed_only"
+
+    return {
+        "label": effort_bucket,
+        "probability": round(bucket_probability, 4),
+        "candidates": bucket_candidates.get("candidates", []),
+        "entropy": bucket_candidates.get("entropy", 1.0),
+        "margin": bucket_candidates.get("margin", 0.0),
+        "estimated_minutes": estimated_minutes,
+        "range_minutes": effort_range,
+        "confidence": round(effort_confidence, 4),
+        "basis": effort_basis,
     }
 
 
@@ -454,7 +555,9 @@ def _fuse_structural_evidence(
 
 
 def _effort_head_is_supervised(metadata: dict[str, Any]) -> bool:
-    value = metadata.get("effort_supervision_samples")
+    value = metadata.get("effort_bucket_supervision_samples")
+    if value is None:
+        value = metadata.get("effort_supervision_samples")
     if value is None:
         # Artifacts produced before the explicit supervision counter are
         # treated as legacy models and retain their previous behavior.

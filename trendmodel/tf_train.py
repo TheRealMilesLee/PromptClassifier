@@ -8,9 +8,16 @@ from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
-from .tf_data import build_label_maps, load_task_records, make_dataset, split_records
+from .tf_data import (
+    build_label_maps,
+    label_balance_weights,
+    load_task_records,
+    make_dataset,
+    split_records,
+)
 from .tf_inference import TensorFlowTaskModel
 from .tf_model import build_text_model, require_tensorflow
+from .tf_features import STRUCTURED_FEATURE_NAMES
 from .tf_runtime import inspect_tensorflow_runtime
 
 
@@ -23,6 +30,7 @@ def train_model(
     validation_ratio: float = 0.2,
     seed: int = 42,
     require_gpu: bool = False,
+    gold_replay_multiplier: float = 8.0,
 ) -> dict[str, object]:
     tf = require_tensorflow()
     runtime = inspect_tensorflow_runtime(tf)
@@ -33,6 +41,8 @@ def train_model(
             "install requirements-tensorflow-cuda.txt and verify nvidia-smi, or "
             "rerun without --require-gpu to use CPU fallback"
         )
+    if gold_replay_multiplier < 1.0:
+        raise ValueError("gold_replay_multiplier must be at least 1")
     tf.keras.utils.set_random_seed(seed)
 
     records = load_task_records(data_path)
@@ -40,7 +50,12 @@ def train_model(
         "workload_type": sum(record.workload_type is not None for record in records),
         "intent": sum(record.intent is not None for record in records),
         "complexity": sum(record.complexity is not None for record in records),
-        "effort": sum(record.effort_supervised for record in records),
+        "effort_bucket": sum(record.effort_bucket_supervised for record in records),
+        # ``effort`` is retained as a stable metadata key, but for new
+        # artifacts it means real numeric-minute supervision.  Bucket-only
+        # targets are counted separately above and never train the regressor.
+        "effort": sum(record.effort_minutes_supervised for record in records),
+        "effort_minutes": sum(record.effort_minutes_supervised for record in records),
         "observed_effort": sum(record.observed_effort for record in records),
         "needs_clarification": sum(record.needs_clarification is not None for record in records),
     }
@@ -58,8 +73,22 @@ def train_model(
         validation_ratio=validation_ratio,
         seed=seed,
     )
-    train_dataset = make_dataset(train_records, label_maps, batch_size=batch_size, shuffle=True)
-    validation_dataset = make_dataset(validation_records, label_maps, batch_size=batch_size)
+    balance_weights = label_balance_weights(train_records, label_maps)
+    train_dataset = make_dataset(
+        train_records,
+        label_maps,
+        batch_size=batch_size,
+        shuffle=True,
+        balance_labels=True,
+        gold_replay_multiplier=gold_replay_multiplier,
+        seed=seed,
+    )
+    validation_dataset = make_dataset(
+        validation_records,
+        label_maps,
+        batch_size=batch_size,
+        seed=seed,
+    )
     model = build_text_model(
         [record.original_prompt for record in train_records],
         label_maps,
@@ -93,15 +122,31 @@ def train_model(
     warnings = _training_warnings(supervision_counts)
     metadata = {
         "model_id": "trendmodel-text-v1",
-        "model_version": "0.1.1",
-        "architecture": "TextVectorization(character) + Embedding + BiGRU + multi-task heads + structured evidence fusion",
+        "model_version": "0.3.0",
+        "architecture": "TextVectorization(character) + Embedding + BiGRU + character n-gram TF-IDF branch + structured feature branch + multi-task heads (including effort bucket) + evidence fusion",
+        "text_encoder": {
+            "character_max_tokens": 12_000,
+            "character_sequence_length": 192,
+            "ngram_max_tokens": 24_000,
+            "ngram_range": [2, 5],
+        },
+        "structured_feature_dim": len(STRUCTURED_FEATURE_NAMES),
+        "structured_feature_names": list(STRUCTURED_FEATURE_NAMES),
         "runtime": runtime,
         "labels": label_maps.to_dict(),
         "training_samples": len(train_records),
         "validation_samples": len(validation_records),
         "supervision_counts": supervision_counts,
+        "label_balance_weights": balance_weights,
+        "gold_replay_multiplier": gold_replay_multiplier,
+        "gold_replay_policy": (
+            "trusted manual/gold/seed/observed labels receive the configured "
+            "training sample-weight multiplier; validation is not replay-weighted"
+        ),
         "observed_effort_samples": supervision_counts["observed_effort"],
+        "effort_bucket_supervision_samples": supervision_counts["effort_bucket"],
         "effort_supervision_samples": supervision_counts["effort"],
+        "effort_minutes_supervision_samples": supervision_counts["effort_minutes"],
         "label_source_counts": dict(Counter(record.label_source for record in records)),
         "source_counts": dict(Counter(record.source for record in records)),
         "warnings": warnings,
@@ -171,7 +216,13 @@ def evaluate_tensorflow_model(
         "by_source": {},
         "label_quality": {},
     }
-    for field in ("workload_type", "intent", "complexity", "needs_clarification"):
+    for field in (
+        "workload_type",
+        "intent",
+        "complexity",
+        "effort_bucket",
+        "needs_clarification",
+    ):
         actual: list[str] = []
         predicted: list[str] = []
         weights: list[float] = []
@@ -191,19 +242,20 @@ def evaluate_tensorflow_model(
     observed_actual: list[float] = []
     observed_predicted: list[float] = []
     for record, prediction in zip(records, predictions):
-        if not record.effort_supervised or prediction["effort"].get("estimated_minutes") is None:
+        if record.effort_bucket_supervised:
+            bucket_actual.append(str(record.effort_bucket))
+            bucket_predicted.append(str(prediction["effort"].get("bucket")))
+        if not record.effort_minutes_supervised or prediction["effort"].get("estimated_minutes") is None:
             continue
         actual_minutes = float(record.effort_minutes)
         predicted_minutes = float(prediction["effort"]["estimated_minutes"])
         effort_actual.append(actual_minutes)
         effort_predicted.append(predicted_minutes)
-        bucket_actual.append(str(record.effort_bucket))
-        bucket_predicted.append(str(prediction["effort"].get("bucket")))
-        if record.observed_effort:
-            observed_actual.append(actual_minutes)
-            observed_predicted.append(predicted_minutes)
+        observed_actual.append(actual_minutes)
+        observed_predicted.append(predicted_minutes)
     metrics["effort"] = {
         "supervised_samples": len(effort_actual),
+        "bucket_supervised_samples": len(bucket_actual),
         "bucket_accuracy": _accuracy(bucket_actual, bucket_predicted),
         "mae_minutes": _mean_absolute_error(effort_actual, effort_predicted),
         "observed_samples": len(observed_actual),
@@ -224,11 +276,15 @@ def evaluate_tensorflow_model(
 
 def _training_warnings(supervision_counts: Mapping[str, int]) -> list[str]:
     warnings: list[str] = []
-    if supervision_counts.get("observed_effort", 0) == 0 and supervision_counts.get("effort", 0) > 0:
+    effort_bucket_samples = supervision_counts.get(
+        "effort_bucket",
+        supervision_counts.get("effort", 0),
+    )
+    if supervision_counts.get("observed_effort", 0) == 0 and effort_bucket_samples > 0:
         warnings.append(
             "effort 只有 bucket/种子标签，没有 observed active_minutes；输出只能视为粗粒度先验"
         )
-    if supervision_counts.get("effort", 0) == 0:
+    if effort_bucket_samples == 0:
         warnings.append("没有 effort supervision；推理时 effort 将输出 unknown")
     return warnings
 
@@ -241,7 +297,13 @@ def _roundtrip_warnings(
 
     warnings: list[str] = []
     heads = artifact_metrics.get("heads", {})
-    for field in ("workload_type", "intent", "complexity", "needs_clarification"):
+    for field in (
+        "workload_type",
+        "intent",
+        "complexity",
+        "effort_bucket",
+        "needs_clarification",
+    ):
         fit_key = f"{field}_accuracy"
         artifact_head = heads.get(field, {})
         fit_value = fit_metrics.get(fit_key)
@@ -266,6 +328,11 @@ def _prediction_label(prediction: Mapping[str, Any], field: str) -> str:
 def _prediction_value(prediction: Mapping[str, Any], field: str) -> Any:
     if field == "needs_clarification":
         return bool(prediction.get(field, False))
+    if field == "effort_bucket":
+        effort = prediction.get("effort", {})
+        if isinstance(effort, Mapping):
+            return str(effort.get("bucket", "unknown"))
+        return "unknown"
     return _prediction_label(prediction, field)
 
 
@@ -292,7 +359,13 @@ def _classification_metrics(
 
 def _evaluate_indexes(records: list[Any], predictions: list[Mapping[str, Any]], indexes: list[int]) -> dict[str, Any]:
     result: dict[str, Any] = {"samples": len(indexes), "heads": {}}
-    for field in ("workload_type", "intent", "complexity", "needs_clarification"):
+    for field in (
+        "workload_type",
+        "intent",
+        "complexity",
+        "effort_bucket",
+        "needs_clarification",
+    ):
         actual: list[str] = []
         predicted: list[str] = []
         weights: list[float] = []
@@ -413,6 +486,12 @@ def build_parser() -> argparse.ArgumentParser:
     train.add_argument("--validation-ratio", type=float, default=0.2)
     train.add_argument("--seed", type=int, default=42)
     train.add_argument(
+        "--gold-replay-multiplier",
+        type=float,
+        default=8.0,
+        help="multiply trusted manual/gold/seed labels during training so weak public data cannot drown them",
+    )
+    train.add_argument(
         "--require-gpu",
         action="store_true",
         help="fail instead of silently falling back to CPU when no GPU/Metal/CUDA device is visible",
@@ -455,6 +534,7 @@ def main(argv: list[str] | None = None) -> int:
             validation_ratio=args.validation_ratio,
             seed=args.seed,
             require_gpu=args.require_gpu,
+            gold_replay_multiplier=args.gold_replay_multiplier,
         )
         print(json.dumps(metadata, ensure_ascii=False, indent=2))
         return 0

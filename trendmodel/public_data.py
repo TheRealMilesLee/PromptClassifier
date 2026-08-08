@@ -1,4 +1,4 @@
-"""Prepare prompt-only records from public Hugging Face conversations.
+"""Prepare prompt-only records from public Hugging Face datasets.
 
 The public corpora are useful for learning prompt distribution and weak
 signals, but they do not contain task effort ground truth.  This module keeps
@@ -27,7 +27,22 @@ DATASET_IDS = {
     "wildchat": "allenai/WildChat-4.8M",
     "lmsys": "lmsys/lmsys-chat-1m",
     "arena": "lmarena-ai/arena-human-preference-140k",
+    "xlam": "Salesforce/xlam-function-calling-60k",
+    "swebench": "SWE-bench/SWE-bench",
+    "swe_trajectories": "nebius/SWE-agent-trajectories",
+    "massive": "AmazonScience/massive",
+    "oasst1": "OpenAssistant/oasst1",
+    "code_feedback": "m-a-p/Code-Feedback",
+    "coig": "BAAI/COIG",
+    "dolly": "databricks/databricks-dolly-15k",
+    "mtop": "tasksource/mtop",
+    "helpful_instructions": "HuggingFaceH4/helpful-instructions",
 }
+
+# MASSIVE has multiple configurations.  The local parquet workflow does not
+# need this value, but it makes the optional streaming path deterministic when
+# someone explicitly requests the remote source.
+DATASET_CONFIGS = {"massive": "all"}
 
 _SECRET_PATTERNS = (
     re.compile(r"-----BEGIN [^-]+ PRIVATE KEY-----.*?-----END [^-]+ PRIVATE KEY-----", re.I | re.S),
@@ -63,13 +78,25 @@ def normalize_public_row(
     if source not in DATASET_IDS:
         raise ValueError(f"unsupported public source: {source}")
 
-    conversation, conversation_id = _conversation_for_source(source, row)
-    extracted = extract_first_user_prompt(conversation)
+    extracted, conversation_id = _extract_prompt_for_source(source, row)
     if extracted is None:
         return None
     prompt, turn_index = extracted
 
-    language = normalize_language(row.get("language", row.get("lang")))
+    language = normalize_language(
+        row.get("language", row.get("lang", row.get("locale")))
+    )
+    if language is None and source in {
+        "xlam",
+        "swebench",
+        "swe_trajectories",
+        "code_feedback",
+        "dolly",
+        "helpful_instructions",
+    }:
+        language = "en"
+    elif language is None and source == "coig":
+        language = "zh"
     if language_filter and language not in language_filter:
         return None
 
@@ -87,6 +114,7 @@ def normalize_public_row(
 
     auxiliary_labels: dict[str, Any] = {}
     workload_type: str | None = None
+    intent: str | None = None
     label_source = "unlabeled"
     label_confidence: float | None = None
     if source == "arena":
@@ -106,6 +134,134 @@ def normalize_public_row(
             label_source = "arena_is_code"
             label_confidence = 0.95
 
+    elif source == "xlam":
+        tools = _as_sequence(row.get("tools"))
+        answers = _as_sequence(row.get("answers"))
+        auxiliary_labels.update(
+            {
+                "requires_tools": True,
+                "tool_count": len(tools),
+                "tool_call_count": len(answers),
+                "multi_step": len(answers) > 1,
+                "label_scope": "tool_use_only",
+            }
+        )
+        # APIGen records are explicitly verified function calls.  They are
+        # strong weak supervision for tool/execute behavior, but not gold
+        # effort labels and not proof that every query is an operations task.
+        workload_type = "operations"
+        intent = "execute"
+        label_source = "xlam_tool_use_weak"
+        label_confidence = 0.85
+
+    elif source == "swebench":
+        patch = str(row.get("patch", "") or "")
+        test_patch = str(row.get("test_patch", "") or "")
+        auxiliary_labels.update(
+            {
+                "requires_files": True,
+                "has_patch": bool(patch.strip()),
+                "has_test_patch": bool(test_patch.strip()),
+                "patch_lines": _patch_line_count(patch),
+                "test_patch_lines": _patch_line_count(test_patch),
+                "repository": _first_non_empty(row.get("repo")),
+            }
+        )
+        # An issue/PR pair is high-confidence evidence for a code change task.
+        # Complexity remains unset because patch size is only a proxy, not
+        # observed human effort.
+        workload_type = "code"
+        intent = "modify"
+        label_source = "swebench_issue_weak"
+        label_confidence = 0.9
+
+    elif source == "swe_trajectories":
+        trajectory = _as_sequence(row.get("trajectory"))
+        auxiliary_labels.update(
+            {
+                "requires_tools": True,
+                "trajectory_steps": len(trajectory),
+                "trajectory_target": _as_optional_bool(row.get("target")),
+                "exit_status": _first_non_empty(row.get("exit_status")),
+                "has_generated_patch": bool(
+                    str(row.get("generated_patch", "") or "").strip()
+                ),
+            }
+        )
+        workload_type = "code"
+        intent = "modify"
+        label_source = "swe_agent_trajectory_weak"
+        label_confidence = 0.8
+
+    elif source == "massive":
+        scenario = _first_non_empty(row.get("scenario"))
+        massive_intent = _first_non_empty(row.get("intent"), row.get("class"))
+        if scenario:
+            auxiliary_labels["scenario"] = scenario
+        if massive_intent:
+            auxiliary_labels["massive_intent"] = massive_intent
+        auxiliary_labels["locale"] = _first_non_empty(row.get("locale"))
+        # MASSIVE consists of assistant-directed, service-oriented utterances.
+        # Preserve the original fine-grained intent and use a conservative
+        # mapping for the generic router intent.  A weather/calendar query is
+        # not the same workload as an explicit "set alarm" command.
+        workload_type = "operations"
+        intent = _massive_generic_intent(massive_intent) or "execute"
+        label_source = "massive_service_intent_weak"
+        label_confidence = 0.72 if massive_intent else 0.55
+
+    elif source == "oasst1":
+        auxiliary_labels["oasst_role"] = _first_non_empty(row.get("role"))
+
+    elif source == "code_feedback":
+        messages = _as_sequence(row.get("messages"))
+        auxiliary_labels.update(
+            {
+                "message_count": len(messages),
+                "label_scope": "code_generation_only",
+            }
+        )
+        workload_type = "code"
+        intent = "create"
+        label_source = "code_feedback_create_weak"
+        label_confidence = 0.88
+
+    elif source == "coig":
+        # COIG is valuable Chinese instruction coverage, but its general
+        # instruction rows do not provide a trustworthy generic workload or
+        # intent label.  Keep it as unlabeled representation data; the
+        # optional TaskTagger pass may add explicitly weak pseudo-labels.
+        auxiliary_labels["label_scope"] = "chinese_instruction_unlabeled"
+
+    elif source == "dolly":
+        category = _first_non_empty(row.get("category"))
+        if category:
+            auxiliary_labels["dolly_category"] = category
+        workload_type = "text"
+        intent = _dolly_generic_intent(category)
+        label_source = "dolly_category_weak"
+        label_confidence = 0.82 if intent else 0.55
+
+    elif source == "mtop":
+        mtop_intent = _first_non_empty(row.get("intent"))
+        domain = _first_non_empty(row.get("domain"))
+        if mtop_intent:
+            auxiliary_labels["mtop_intent"] = mtop_intent
+        if domain:
+            auxiliary_labels["mtop_domain"] = domain
+        # MTOP is a task-oriented semantic parsing corpus.  Its intent names
+        # are useful weak supervision for the router's explain-vs-execute
+        # boundary, but the domain is much narrower than general chat.
+        workload_type = "operations"
+        intent = _mtop_generic_intent(mtop_intent)
+        label_source = "mtop_intent_weak"
+        label_confidence = 0.76 if intent else 0.55
+
+    elif source == "helpful_instructions":
+        # Curated instructions add expression coverage, but do not expose
+        # trustworthy workload, intent, or effort labels.
+        auxiliary_labels["label_scope"] = "english_instruction_unlabeled"
+
     split_group = f"{source}:{conversation_id or raw_id}"
     return {
         "source": source,
@@ -114,7 +270,7 @@ def normalize_public_row(
         "original_prompt": prompt,
         "language": language,
         "workload_type": workload_type,
-        "intent": None,
+        "intent": intent,
         "complexity": None,
         "effort_minutes": None,
         "effort_bucket": None,
@@ -152,6 +308,78 @@ def extract_first_user_prompt(conversation: Any) -> tuple[str, int] | None:
         if content:
             return content, index
     return None
+
+
+def _extract_prompt_for_source(
+    source: str,
+    row: Mapping[str, Any],
+) -> tuple[tuple[str, int] | None, str | None]:
+    """Extract one task prompt and its source grouping key.
+
+    The public sources intentionally converge to one prompt-only record, but
+    their schemas are not interchangeable: some are conversations, some are
+    issue reports, and some expose a direct ``query``/``utt`` field.
+    """
+
+    if source in {"wildchat", "lmsys", "arena"}:
+        conversation, conversation_id = _conversation_for_source(source, row)
+        return extract_first_user_prompt(conversation), conversation_id
+
+    conversation_id = _first_non_empty(
+        row.get("conversation_id"),
+        row.get("conversation_hash"),
+        row.get("evaluation_session_id"),
+        row.get("instance_id"),
+        row.get("id"),
+    )
+    if source == "xlam":
+        query = _first_non_empty(
+            row.get("query"), row.get("prompt"), row.get("instruction")
+        )
+        return ((query, 0) if query else None), conversation_id
+    if source == "swebench":
+        statement = _first_non_empty(
+            row.get("problem_statement"), row.get("issue"), row.get("prompt")
+        )
+        return ((statement, 0) if statement else None), conversation_id
+    if source == "massive":
+        utterance = _first_non_empty(
+            row.get("utt"), row.get("utterance"), row.get("text")
+        )
+        return ((utterance, 0) if utterance else None), conversation_id
+    if source == "oasst1":
+        role = _message_role(row)
+        if role not in {"prompter", "user", "human"}:
+            return None, conversation_id
+        text = _first_non_empty(row.get("text"), row.get("content"))
+        return ((text, 0) if text else None), conversation_id
+    if source == "swe_trajectories":
+        extracted = extract_first_user_prompt(row.get("trajectory"))
+        if extracted is not None:
+            return extracted, conversation_id
+        prompt = _first_non_empty(row.get("problem_statement"), row.get("prompt"))
+        return ((prompt, 0) if prompt else None), conversation_id
+    if source == "code_feedback":
+        extracted = extract_first_user_prompt(row.get("messages", row.get("conversation")))
+        if extracted is not None:
+            return extracted, conversation_id
+        prompt = _first_non_empty(row.get("instruction"), row.get("prompt"), row.get("text"))
+        return ((prompt, 0) if prompt else None), conversation_id
+    if source == "coig":
+        prompt = _first_non_empty(row.get("instruction"), row.get("prompt"), row.get("text"))
+        return ((prompt, 0) if prompt else None), conversation_id
+    if source == "dolly":
+        prompt = _first_non_empty(row.get("instruction"), row.get("prompt"), row.get("text"))
+        return ((prompt, 0) if prompt else None), conversation_id
+    if source == "mtop":
+        prompt = _first_non_empty(row.get("question"), row.get("utterance"), row.get("text"))
+        return ((prompt, 0) if prompt else None), conversation_id
+    if source == "helpful_instructions":
+        prompt = _first_non_empty(
+            row.get("instruction"), row.get("prompt"), row.get("text")
+        )
+        return ((prompt, 0) if prompt else None), conversation_id
+    raise ValueError(f"unsupported public source: {source}")
 
 
 def normalize_language(value: Any) -> str | None:
@@ -385,6 +613,122 @@ def _as_optional_bool(value: Any) -> bool | None:
     return str(value).strip().casefold() in {"1", "true", "yes", "y"}
 
 
+def _as_sequence(value: Any) -> list[Any]:
+    """Decode a list-like JSON field without trusting arbitrary objects."""
+
+    decoded = _decode_json(value)
+    if isinstance(decoded, (list, tuple)):
+        return list(decoded)
+    return []
+
+
+def _patch_line_count(patch: str) -> int:
+    return sum(
+        1
+        for line in str(patch).splitlines()
+        if line.startswith(("+", "-")) and not line.startswith(("+++", "---"))
+    )
+
+
+def _dolly_generic_intent(category: str | None) -> str | None:
+    """Map Dolly's task categories to the router's coarser intent vocabulary."""
+
+    normalized = str(category or "").strip().casefold()
+    return {
+        "brainstorming": "create",
+        "classification": "classify",
+        "closed_qa": "explain",
+        "creative_writing": "create",
+        "general_qa": "explain",
+        "information_extraction": "extract",
+        "open_qa": "explain",
+        "summarization": "summarize",
+    }.get(normalized)
+
+
+def _massive_generic_intent(intent: str | None) -> str | None:
+    """Map MASSIVE service intents without treating every utterance as execute."""
+
+    normalized = str(intent or "").strip().casefold().replace("-", "_")
+    if not normalized:
+        return None
+    if "translat" in normalized:
+        return "translate"
+    if any(
+        marker in normalized
+        for marker in (
+            "cancel",
+            "set_",
+            "create_",
+            "add_",
+            "remove_",
+            "delete_",
+            "activate",
+            "deactivate",
+            "turn_on",
+            "turn_off",
+            "play_",
+            "stop_",
+            "send_",
+            "call_",
+            "open_",
+            "close_",
+            "schedule_",
+        )
+    ):
+        return "execute"
+    if any(marker in normalized for marker in ("query", "where", "when", "what", "which", "info")):
+        return "explain"
+    return None
+
+
+def _mtop_generic_intent(intent: str | None) -> str | None:
+    """Map MTOP semantic parses to the router's coarse generic intent."""
+
+    normalized = str(intent or "").strip().casefold()
+    if not normalized:
+        return None
+    normalized = normalized.removeprefix("in:").replace("-", "_")
+    if any(
+        marker in normalized
+        for marker in (
+            "create",
+            "send",
+            "set_",
+            "cancel",
+            "delete",
+            "add_",
+            "remove",
+            "turn_on",
+            "turn_off",
+            "play_",
+            "stop_",
+            "book",
+            "call",
+            "schedule",
+            "make_",
+        )
+    ):
+        return "execute"
+    if any(
+        marker in normalized
+        for marker in (
+            "get_",
+            "check_",
+            "query",
+            "search",
+            "find",
+            "show",
+            "list",
+            "where",
+            "when",
+            "what",
+        )
+    ):
+        return "explain"
+    return None
+
+
 def _normalize_category_tag(value: Any) -> list[str]:
     if value is None:
         return []
@@ -439,7 +783,11 @@ def _load_huggingface_source(
             "需要先安装 requirements-data.txt，才能读取 Hugging Face 数据集"
         ) from error
 
-    dataset = load_dataset(DATASET_IDS[source], split=split, streaming=True)
+    config = DATASET_CONFIGS.get(source)
+    if config:
+        dataset = load_dataset(DATASET_IDS[source], config, split=split, streaming=True)
+    else:
+        dataset = load_dataset(DATASET_IDS[source], split=split, streaming=True)
     # Streaming shuffle avoids selecting a potentially ordered prefix while
     # keeping the initial prototype bounded by the per-source limit.
     if shuffle_buffer_size > 1 and hasattr(dataset, "shuffle"):
@@ -465,7 +813,21 @@ def prepare_public_corpora(
         raise ValueError(f"unsupported public sources: {', '.join(invalid)}")
 
     limits = (
-        {"wildchat": 50_000, "lmsys": 50_000, "arena": 20_000}
+        {
+            "wildchat": 50_000,
+            "lmsys": 50_000,
+            "arena": 20_000,
+            "xlam": 0,
+            "swebench": 0,
+            "swe_trajectories": 0,
+            "massive": 0,
+            "oasst1": 0,
+            "code_feedback": 0,
+            "coig": 0,
+            "dolly": 0,
+            "mtop": 0,
+            "helpful_instructions": 0,
+        }
         if limits is None
         else dict(limits)
     )
@@ -535,16 +897,29 @@ def write_jsonl(records: Iterable[Mapping[str, Any]], output: str | Path) -> int
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m trendmodel.public_data",
-        description="Prepare prompt-only samples from WildChat, LMSYS and Arena.",
+        description="Prepare prompt-only samples from local or remote public datasets.",
     )
     parser.add_argument(
         "--sources",
         default="wildchat,lmsys,arena",
-        help="comma-separated sources (wildchat,lmsys,arena)",
+        help=(
+            "comma-separated sources; supported: wildchat,lmsys,arena,xlam,"
+            "swebench,swe_trajectories,massive,oasst1,code_feedback,coig,dolly"
+            ",mtop"
+        ),
     )
     parser.add_argument("--wildchat-limit", type=int, default=50_000)
     parser.add_argument("--lmsys-limit", type=int, default=50_000)
     parser.add_argument("--arena-limit", type=int, default=20_000)
+    parser.add_argument("--xlam-limit", type=int, default=0)
+    parser.add_argument("--swebench-limit", type=int, default=0)
+    parser.add_argument("--swe-trajectories-limit", type=int, default=0)
+    parser.add_argument("--massive-limit", type=int, default=0)
+    parser.add_argument("--oasst1-limit", type=int, default=0)
+    parser.add_argument("--code-feedback-limit", type=int, default=0)
+    parser.add_argument("--coig-limit", type=int, default=0)
+    parser.add_argument("--dolly-limit", type=int, default=0)
+    parser.add_argument("--mtop-limit", type=int, default=0)
     parser.add_argument(
         "--languages",
         default="en,zh",
@@ -572,6 +947,15 @@ def main(argv: list[str] | None = None) -> int:
         "wildchat": args.wildchat_limit,
         "lmsys": args.lmsys_limit,
         "arena": args.arena_limit,
+        "xlam": args.xlam_limit,
+        "swebench": args.swebench_limit,
+        "swe_trajectories": args.swe_trajectories_limit,
+        "massive": args.massive_limit,
+        "oasst1": args.oasst1_limit,
+        "code_feedback": args.code_feedback_limit,
+        "coig": args.coig_limit,
+        "dolly": args.dolly_limit,
+        "mtop": args.mtop_limit,
     }
     try:
         records = prepare_public_corpora(

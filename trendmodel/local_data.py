@@ -9,7 +9,9 @@ need it.
 
 from __future__ import annotations
 
+import gzip
 import hashlib
+import json
 from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
@@ -40,6 +42,30 @@ def discover_parquet_files(raw_dir: str | Path, source: str) -> list[Path]:
     return sorted(files)
 
 
+def discover_data_files(raw_dir: str | Path, source: str) -> list[Path]:
+    """Find supported local data files, including JSON/JSONL source formats."""
+
+    root = Path(raw_dir)
+    source = str(source).strip().lower()
+    if source not in DATASET_IDS:
+        raise ValueError(f"unsupported local source: {source}")
+    candidates = [
+        root / source,
+        root / DATASET_IDS[source].split("/", 1)[-1],
+        root / DATASET_IDS[source].replace("/", "__"),
+    ]
+    suffixes = ("*.parquet", "*.json", "*.jsonl", "*.json.gz", "*.jsonl.gz")
+    files: set[Path] = set()
+    for candidate in candidates:
+        if candidate.exists():
+            for suffix in suffixes:
+                files.update(path for path in candidate.rglob(suffix) if path.is_file())
+    if not files and root.exists():
+        for suffix in suffixes:
+            files.update(path for path in root.glob(suffix) if path.is_file())
+    return sorted(files)
+
+
 def iter_parquet_rows(
     files: Iterable[str | Path],
     *,
@@ -60,6 +86,42 @@ def iter_parquet_rows(
                 yield row
 
 
+def iter_local_rows(files: Iterable[str | Path], *, batch_size: int = 512) -> Iterable[Mapping[str, Any]]:
+    """Yield mappings from local parquet, JSON, JSONL, and gzipped JSONL files."""
+
+    for file_value in files:
+        path = Path(file_value)
+        if path.suffix == ".parquet":
+            yield from iter_parquet_rows([path], batch_size=batch_size)
+            continue
+        if path.name.endswith(".gz"):
+            handle = gzip.open(path, "rt", encoding="utf-8")
+        else:
+            handle = path.open("rt", encoding="utf-8")
+        with handle:
+            if path.name.endswith((".jsonl", ".jsonl.gz")):
+                for line in handle:
+                    if not line.strip():
+                        continue
+                    value = json.loads(line)
+                    if isinstance(value, Mapping):
+                        yield value
+                continue
+            value = json.load(handle)
+            if isinstance(value, list):
+                for row in value:
+                    if isinstance(row, Mapping):
+                        yield row
+            elif isinstance(value, Mapping):
+                rows = value.get("data", value.get("records"))
+                if isinstance(rows, list):
+                    for row in rows:
+                        if isinstance(row, Mapping):
+                            yield row
+                else:
+                    yield value
+
+
 def prepare_local_corpora(
     raw_dir: str | Path,
     *,
@@ -76,7 +138,21 @@ def prepare_local_corpora(
     if invalid:
         raise ValueError(f"unsupported local sources: {', '.join(invalid)}")
     limits = (
-        {"wildchat": 50_000, "lmsys": 50_000, "arena": 20_000}
+        {
+            "wildchat": 50_000,
+            "lmsys": 50_000,
+            "arena": 20_000,
+            "xlam": 0,
+            "swebench": 0,
+            "swe_trajectories": 0,
+            "massive": 0,
+            "oasst1": 0,
+            "code_feedback": 0,
+            "coig": 0,
+            "dolly": 0,
+            "mtop": 0,
+            "helpful_instructions": 0,
+        }
         if limits is None
         else dict(limits)
     )
@@ -87,13 +163,13 @@ def prepare_local_corpora(
         limit = int(limits.get(source, 0))
         if limit == 0:
             continue
-        files = discover_parquet_files(raw_dir, source)
+        files = discover_data_files(raw_dir, source)
         if not files:
             raise FileNotFoundError(
-                f"没有找到 {source} 的 parquet 文件，请检查本地目录：{Path(raw_dir) / source}"
+                f"没有找到 {source} 的本地数据文件，请检查目录：{Path(raw_dir) / source}"
             )
         accepted = 0
-        for row_index, row in enumerate(iter_parquet_rows(files, batch_size=batch_size)):
+        for row_index, row in enumerate(iter_local_rows(files, batch_size=batch_size)):
             record = normalize_public_row(
                 source,
                 row,

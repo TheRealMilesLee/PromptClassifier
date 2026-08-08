@@ -67,6 +67,7 @@ class TensorFlowEvaluationTest(unittest.TestCase):
                 effort_minutes=90,
                 effort_bucket="M",
                 needs_clarification=False,
+                observed_effort=True,
                 label_source="manual_gold",
             ),
             TaskRecord(
@@ -78,6 +79,17 @@ class TensorFlowEvaluationTest(unittest.TestCase):
                 effort_bucket=None,
                 needs_clarification=False,
                 label_source="manual_gold",
+            ),
+            TaskRecord(
+                original_prompt="总结文档",
+                workload_type="text",
+                intent="summarize",
+                complexity="low",
+                effort_minutes=30,
+                effort_bucket="S",
+                needs_clarification=False,
+                observed_effort=False,
+                label_source="manual_bucket",
             ),
         ]
 
@@ -92,8 +104,11 @@ class TensorFlowEvaluationTest(unittest.TestCase):
         self.assertEqual(model.raw_calls, 1)
         self.assertEqual(model.fused_calls, 1)
         self.assertIn("needs_clarification", raw["heads"])
-        self.assertEqual(raw["heads"]["workload_type"]["accuracy"], 0.5)
+        self.assertEqual(raw["heads"]["workload_type"]["accuracy"], 0.6667)
         self.assertEqual(fused["heads"]["workload_type"]["accuracy"], 1.0)
+        self.assertEqual(raw["effort"]["supervised_samples"], 1)
+        self.assertEqual(raw["effort"]["bucket_supervised_samples"], 2)
+        self.assertEqual(raw["effort"]["observed_samples"], 1)
 
     def test_unknown_mode_is_rejected(self) -> None:
         with self.assertRaises(ValueError):
