@@ -20,6 +20,9 @@ TrendModel 是给 Auto Router 使用的轻量级 prompt 标签模型。它只负
 想了解为什么采用当前的数据、模型结构、证据融合和 effort 监督方式，请阅读
 [设计说明](docs/DESIGN.md)。
 
+如果想从输入到输出逐层理解当前模型，以及 BiGRU、Embedding、TF-IDF、TaskAST、
+Task IR、calibration 和 abstention 等术语，请阅读[模型 Walkthrough](docs/MODEL_WALKTHROUGH.md)。
+
 训练产物位于本机 `artifacts/trendmodel-text-v1/`，不提交到 Git。下游只需要复制整个 artifact 目录以及兼容的 Python/TensorFlow runtime。公共数据集的筛选、许可证和本机 adapter 见 [数据集说明](docs/DATASETS.md)。
 
 ## 当前架构

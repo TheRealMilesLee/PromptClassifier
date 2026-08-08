@@ -1743,6 +1743,7 @@ Salesforce AI Research. (n.d.). *xLAM function calling 60K* [Data set]. Hugging 
 ### 23.5 相关文档
 
 - [README](../README.md)：快速运行、训练和 CUDA/Metal 环境；
+- [模型 Walkthrough](MODEL_WALKTHROUGH.md)：面向开发者的输入到输出链路和关键术语解释；
 - [数据集策略](DATASETS.md)：数据源、许可证、adapter 和本地下载；
 - [下游集成手册](INTEGRATION.md)：Python、OpenAI-compatible API 和 JSON contract；
 - [Task Analysis Schema](task-analysis.schema.json)：机器可读输出 schema；
