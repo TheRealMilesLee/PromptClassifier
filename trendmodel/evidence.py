@@ -4,28 +4,17 @@ from __future__ import annotations
 
 import re
 import unicodedata
-from dataclasses import dataclass
-from typing import Mapping
 
+from .task_ast import TaskAST
 from .task_ir import TaskConstraints, TaskEvidence
 
 
-@dataclass(frozen=True)
-class StructuredEvidence:
-    """Signals that can be observed without pretending to understand prose."""
-
-    constraints: TaskConstraints
-    language: str | None
-    operations: tuple[str, ...]
-    signals: tuple[TaskEvidence, ...]
-    intent_scores: Mapping[str, float]
-    domain_scores: Mapping[str, float]
-    artifact_scores: Mapping[str, float]
-    high_risk: bool
-    risk_reasons: tuple[str, ...]
+# Keep the old import path working for downstream callers.  New code should
+# use TaskAST to make the intermediate representation explicit.
+StructuredEvidence = TaskAST
 
 
-def extract_evidence(text: str) -> StructuredEvidence:
+def extract_evidence(text: str) -> TaskAST:
     """Extract code/file/command/math and domain-specific evidence.
 
     A match contributes a bounded likelihood hint.  It never directly sets
@@ -151,7 +140,8 @@ def extract_evidence(text: str) -> StructuredEvidence:
         has_math_symbols=has_math_symbols,
         has_urls=has_urls,
     )
-    return StructuredEvidence(
+    return TaskAST(
+        original_prompt=original,
         constraints=constraints,
         language=language,
         operations=tuple(dict.fromkeys(operations)),

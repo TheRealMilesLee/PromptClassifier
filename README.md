@@ -31,7 +31,7 @@ TrendModel 是给 Auto Router 使用的轻量级 prompt 标签模型。它只负
    ↓
 层级原型分类：intent / domain / artifact
    ↓
-结构化证据：语言、文件、命令、数学符号、操作约束
+TaskAST：统一封装语言、文件、命令、数学符号、操作约束和风险 evidence
    ↓
 概率融合：semantic 0.70 + structural 0.20 + context prior 0.10
    ↓
@@ -67,6 +67,16 @@ result = tagger.predict(
     context={"in_project": True, "allow_modify_files": False},
 )
 payload = result.to_dict()
+```
+
+如果需要调试或审计结构化解析结果，可以直接读取 `TaskAST`；它是内部中间结构，不是最终 Router 输出：
+
+```python
+from trendmodel import TaskAST
+from trendmodel.evidence import extract_evidence
+
+ast: TaskAST = extract_evidence("请解释 ./src/main.cpp 中的 DNS 解析逻辑")
+print(ast.to_dict())
 ```
 
 输出包含这些核心字段；`predictions.*` 还提供 `entropy` 和 `margin`，便于 router 识别多个候选接近的请求：

@@ -6,7 +6,7 @@
 
 本文定义 TrendModel 的问题边界、数据流、模型结构和推理算法。TrendModel 的输入是一段用户 prompt，输出是面向 Auto Router 的结构化任务分析，而不是最终答案。系统需要同时判断用户意图、workload 类型、复杂度、粗粒度 effort、是否需要澄清，以及代码、文件、命令、工具和风险等可观测约束。
 
-本文采用“语义表示 + Task AST-like 结构化证据 + Bayesian-style 融合 + Task IR”的分层设计。文本编码器负责理解自然语言整体语义；结构化解析器负责提取代码块、语言、路径、命令、操作和风险等确定性信号；融合层负责组合不同来源的证据并管理不确定性；Task IR 则作为下游 Router 的稳定接口。贝叶斯方法在本系统中不是中文语义理解器，也不是一个独立的训练模型，而是位于分类输出之后的证据融合和置信度管理层。
+本文采用“语义表示 + TaskAST 结构化证据 + Bayesian-style 融合 + Task IR”的分层设计。这里的 `TaskAST` 是正式的 Python dataclass，但它不是编程语言语法树，而是面向任务路由的结构化中间层。文本编码器负责理解自然语言整体语义；结构化解析器负责提取代码块、语言、路径、命令、操作和风险等确定性信号；融合层负责组合不同来源的证据并管理不确定性；Task IR 则作为下游 Router 的稳定接口。贝叶斯方法在本系统中不是中文语义理解器，也不是一个独立的训练模型，而是位于分类输出之后的证据融合和置信度管理层。
 
 当前 TensorFlow 主模型使用字符级 `BiGRU`、字符 n-gram `TF-IDF`、56 维结构化特征分支和多任务 heads。系统还保留了一个可插拔的句向量 + 原型分类路径，作为解释性 TaskTagger 和结构化 evidence teacher。文档同时区分当前已实现能力、概念架构和待补齐的数据/标注能力，避免把弱标签、规则分数或未经校准的 probability 误写成真实准确率。
 
@@ -106,7 +106,7 @@ TaskRequest
 └── evidence: observable signals with strength and detail
 ```
 
-当前仓库还没有名为 `TaskAST` 的独立 class；这一概念由 `StructuredEvidence`、`TaskConstraints`、`TaskEvidence` 以及 `intent_scores`、`domain_scores`、`artifact_scores` 共同实现 [C1][C2]。因此，本文使用“Task AST-like evidence structure”描述当前实现，而不声称代码已经实现了一个通用 AST parser。`extract_evidence()` 输出的是候选分数和可观测信号，不是最终分类结果；同一个请求可以同时拥有 `debug`、`modify` 和 `execute` 的证据，最终选择仍由语义模型、规则优先级和融合策略共同决定。
+当前 `TaskAST` dataclass 统一封装 `StructuredEvidence` 过去分散承载的内容：`TaskConstraints`、`TaskEvidence` 序列、`intent_scores`、`domain_scores`、`artifact_scores`、语言、操作和风险原因 [C1][C2][C11]。它仍然不是一个通用 AST parser；`extract_evidence()` 输出的是候选分数和可观测信号，不是最终分类结果。同一个请求可以同时拥有 `debug`、`modify` 和 `execute` 的证据，最终选择仍由语义模型、规则优先级和融合策略共同决定。原来的 `StructuredEvidence` 名称保留为 `TaskAST` 的兼容别名，避免破坏已有调用方。
 
 例如输入：
 
@@ -145,7 +145,7 @@ Task IR 的设计原则是：
 
 ### 3.3 从输入到输出的算法链路
 
-下面的伪代码描述完整的推理链路。`Task AST` 在当前实现中是结构化 evidence 集合；`BayesianFuse` 是 Bayesian-style 的受限近似，而不是已校准的严格后验。
+下面的伪代码描述完整的推理链路。`TaskAST` 保存结构化 evidence；`BayesianFuse` 是 Bayesian-style 的受限近似，而不是已校准的严格后验。
 
 ```text
 Algorithm 1: TrendModelAnalyze(prompt, optional_context)
@@ -159,7 +159,7 @@ Output:
 1.  Validate x_raw is non-empty.
 2.  x_model ← normalize line separators for model tokenization;
     preserve x_raw for output and audit.
-3.  A ← ExtractTaskASTLikeEvidence(x_raw)
+3.  A ← ExtractTaskAST(x_raw)
     where A contains language, actions, domains, artifact hints,
     operations, constraints, risk and observable evidence.
 4.  s_struct ← EncodeStructuredFeatures(A)        # current width: 56
@@ -1009,6 +1009,7 @@ record with observed active_minutes:
 | `trendmodel/data_cleaning.py` | 规范化、脱敏、去重、拒绝原因和报告 | 是 |
 | `trendmodel/embedding.py` | `HashEmbedder` 和可选 SentenceTransformer backend | TaskTagger/准备数据辅助 |
 | `trendmodel/evidence.py` | 规则提取语言、intent/domain/artifact、operation、constraint、risk | 是，训练和推理共用 |
+| `trendmodel/task_ast.py` | 正式 `TaskAST` dataclass、候选分数、风险和 evidence 的统一封装 | 是 |
 | `trendmodel/task_ir.py` | prototype 路径的 Task IR dataclass 和 JSON 序列化 | TaskTagger 路径 |
 | `trendmodel/prototypes.py` + `trendmodel/tagger.py` | 原型相似度、层级选择、结构化融合和解释性 Task IR | evidence teacher / 可选独立路径 |
 | `trendmodel/fusion.py` | cosine、softmax、加权融合、乘法 Bayesian-style 实验和不确定性 | 是 |
@@ -1022,7 +1023,7 @@ record with observed active_minutes:
 
 ### 22.2 训练与推理时的代码边界
 
-训练阶段，`tf_features.structured_feature_vector()` 调用 `evidence.extract_evidence()`，把规则事实编码进 56 维结构化输入；`tf_model.build_text_model()` 再把文本分支和结构分支融合，训练六个 heads [C5][C6]。推理阶段，`tf_inference.TensorFlowTaskModel` 先取得 raw heads，再调用 `TaskTagger` 获取高置信 evidence，对 workload、intent、complexity 做受限融合，最后构造 JSON [C3][C8]。
+训练阶段，`tf_features.structured_feature_vector()` 调用 `evidence.extract_evidence()` 得到 `TaskAST`，再把其中的规则事实编码进 56 维结构化输入；`tf_model.build_text_model()` 再把文本分支和结构分支融合，训练六个 heads [C5][C6][C11]。推理阶段，`tf_inference.TensorFlowTaskModel` 先取得 raw heads，再调用 `TaskTagger` 获取高置信 evidence，对 workload、intent、complexity 做受限融合，最后构造 JSON [C3][C8]。
 
 这条边界有三个工程含义：
 
@@ -1116,6 +1117,8 @@ TrendModel 不应根据自己的输出直接执行 Shell、修改文件或授予
 [C9] [`trendmodel/tf_train.py`](../trendmodel/tf_train.py)：训练、评估、保存、reload round-trip 和 metadata。
 
 [C10] [`trendmodel/train.py`](../trendmodel/train.py)、[`public_data.py`](../trendmodel/public_data.py)、[`local_data.py`](../trendmodel/local_data.py)、[`data_cleaning.py`](../trendmodel/data_cleaning.py)：本地数据准备、adapter 和清洗边界。
+
+[C11] [`trendmodel/task_ast.py`](../trendmodel/task_ast.py)：正式 `TaskAST` dataclass、候选访问、序列化和兼容性边界。
 
 ### 23.4 相关文档
 

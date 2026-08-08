@@ -5,6 +5,7 @@ from .data_cleaning import CleaningConfig, clean_records
 from .model import TaskModel
 from .schema import TrainingExample
 from .tagger import TaskTagger
+from .task_ast import TaskAST
 from .task_ir import TaskIR
 
 __all__ = [
@@ -13,6 +14,7 @@ __all__ = [
     "CleaningConfig",
     "clean_records",
     "TaskIR",
+    "TaskAST",
     "TaskModel",
     "TaskTagger",
     "TrainingExample",

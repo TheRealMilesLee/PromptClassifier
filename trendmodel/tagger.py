@@ -8,9 +8,10 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 from .embedding import Embedder, HashEmbedder
-from .evidence import StructuredEvidence, extract_evidence
+from .evidence import extract_evidence
 from .fusion import FusionResult, FusionWeights, confidence, fuse_probabilities, ranked, softmax
 from .prototypes import PrototypeCatalog, default_catalog
+from .task_ast import TaskAST
 from .task_ir import (
     CapabilityDemand,
     LabelCandidate,
@@ -243,7 +244,7 @@ class TaskTagger:
     def _select_intent(
         self,
         result: FusionResult,
-        evidence: StructuredEvidence,
+        evidence: TaskAST,
         prompt: str,
     ) -> str:
         if evidence.intent_scores:
@@ -298,7 +299,7 @@ class TaskTagger:
     def _select_domains(
         self,
         result: FusionResult,
-        evidence: StructuredEvidence,
+        evidence: TaskAST,
     ) -> list[TaskPrediction]:
         ordered = ranked(result.posterior, limit=4)
         if not ordered:
@@ -317,7 +318,7 @@ class TaskTagger:
         self,
         result: FusionResult,
         intent_label: str,
-        evidence: StructuredEvidence,
+        evidence: TaskAST,
     ) -> tuple[str, float]:
         top_label, top_probability = ranked(result.posterior, limit=1)[0]
         if intent_label == "explain":
@@ -357,7 +358,7 @@ class TaskTagger:
         intent: str,
         domains: Sequence[TaskPrediction],
         mixed_request: bool,
-        evidence: StructuredEvidence,
+        evidence: TaskAST,
         prompt: str,
     ) -> str:
         if mixed_request:
@@ -399,7 +400,7 @@ class TaskTagger:
 
     def _workload_structural_scores(
         self,
-        evidence: StructuredEvidence,
+        evidence: TaskAST,
         artifact: str,
         intent: str,
         domains: Sequence[TaskPrediction],
@@ -443,7 +444,7 @@ class TaskTagger:
             scores["analysis"] = max(scores["analysis"], 0.55)
         return scores
 
-    def _is_mixed_request(self, prompt: str, evidence: StructuredEvidence) -> bool:
+    def _is_mixed_request(self, prompt: str, evidence: TaskAST) -> bool:
         """Detect multiple deliverables without flattening every conjunction."""
 
         connector = bool(
@@ -493,7 +494,7 @@ class TaskTagger:
         self,
         scores: dict[str, float],
         intent: str,
-        evidence: StructuredEvidence,
+        evidence: TaskAST,
     ) -> None:
         if intent == "explain":
             scores["technical_explanation"] = max(scores.get("technical_explanation", 0.0), 0.82)
@@ -508,7 +509,7 @@ class TaskTagger:
         self,
         scores: dict[str, float],
         intent: str,
-        evidence: StructuredEvidence,
+        evidence: TaskAST,
     ) -> None:
         """Use the action only as a weak domain prior when structure is sparse."""
 
@@ -530,7 +531,7 @@ class TaskTagger:
         intent: str,
         artifact: str,
         domains: Sequence[TaskPrediction],
-        evidence: StructuredEvidence,
+        evidence: TaskAST,
         prompt: str,
     ) -> CapabilityDemand:
         reasoning_base = {
@@ -590,7 +591,7 @@ class TaskTagger:
     def _complexity_score(
         self,
         capability: CapabilityDemand,
-        evidence: StructuredEvidence,
+        evidence: TaskAST,
         domains: Sequence[TaskPrediction],
     ) -> float:
         value = (
@@ -625,7 +626,7 @@ class TaskTagger:
         self,
         complexity_score: float,
         capability: CapabilityDemand,
-        evidence: StructuredEvidence,
+        evidence: TaskAST,
         risk_level: str,
     ) -> dict[str, Any]:
         score_value = (
@@ -661,7 +662,7 @@ class TaskTagger:
             "basis": "heuristic; calibrate with observed active_minutes",
         }
 
-    def _risk_level(self, intent: str, evidence: StructuredEvidence) -> str:
+    def _risk_level(self, intent: str, evidence: TaskAST) -> str:
         if evidence.high_risk and intent in {"execute", "create", "modify", "debug"}:
             return "high"
         if evidence.high_risk or evidence.constraints.requires_tools or intent in {"execute", "modify", "debug"}:
