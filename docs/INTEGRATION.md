@@ -2,7 +2,7 @@
 
 本文档是另一个项目接入 TrendModel 的主入口。TrendModel 只负责把用户 prompt 转换成路由标签和不确定性信息，不负责生成最终答案、选择具体供应商模型或执行工具。
 
-当前推荐 artifact：`trendmodel-text-v1`。重新训练后模型版本为 `0.3.0`，它包含 structured feature branch、受控类别重加权和 `effort_bucket` 分类头；已有 text-only artifact 仍可被兼容加载。
+当前推荐 artifact：`trendmodel-text-v1`。重新训练后模型版本为 `0.3.0`，它包含内置 TaskAST structured feature branch、受控类别重加权和 `effort_bucket` 分类头；已有 text-only artifact 仍可被兼容加载。
 
 ## 1. 选择接入方式
 
@@ -217,7 +217,7 @@ analysis = json.loads(response.choices[0].message.content)
 | `predictions` | `object` | 带 probability 和 Top 3 candidates 的推荐结构 |
 | `effort` | `object` | effort bucket、粗略分钟数、区间和监督来源 |
 | `evidence` | `array` | 可观察的结构化信号，不是模型自由生成的解释 |
-| `fusion` | `object` | 语义模型、结构化 teacher 和融合策略版本信息 |
+| `fusion` | `object` | TensorFlow 模型、TaskAST schema 和是否启用 post-hoc probability fusion |
 | `needs_clarification` | `boolean` | 是否需要补充信息或人工确认 |
 | `clarification_reasons` | `array[string]` | 触发澄清的原因 |
 | `confidence` | `object` | 各 head 最高分和整体路由分数 |
@@ -239,7 +239,7 @@ analysis = json.loads(response.choices[0].message.content)
 }
 ```
 
-`probability` 是该 head 在融合后的类别分布中的分数，范围为 `[0, 1]`。它适合做候选排序、阈值判断和模型选择权重，不应直接解释成“模型有 81% 的真实正确率”。当前还没有足够的独立 gold 数据进行 calibration。
+`probability` 是该 TensorFlow head 输出分布中选中类别的分数，范围为 `[0, 1]`。TaskAST 已经作为结构化输入参与模型计算，但推理阶段不会再把 evidence 作为第二次规则概率修正。该分数适合做候选排序、阈值判断和模型选择权重，不应直接解释成“模型有 81% 的真实正确率”。当前还没有足够的独立 gold 数据进行 calibration。
 
 `candidates` 只展示 Top 3。完整内部分布的总和为 1，但 Top 3 的分数加起来通常小于 1。
 
@@ -410,8 +410,9 @@ python -m trendmodel.train prepare \
 
 评估报告会把两种口径分开：
 
-- `raw`：只使用 TensorFlow 神经网络 head，不调用 `TaskTagger`；
-- `fused`：调用下游实际使用的结构化证据融合逻辑。
+- `raw`：TensorFlow heads 的输出；TaskAST 已作为模型输入，不做 post-hoc fusion；
+- `inference`：生产 JSON contract，增加同一份 TaskAST evidence，但概率保持不变；
+- `fused`：旧命令兼容别名，等同于 `inference`，不再表示第二次概率融合。
 
 默认 `--split validation` 使用与训练相同的确定性留出策略。`--split all` 会包含
 训练样本，只适合做数据分布诊断，不能作为泛化指标。独立人工标注集准备好后，
@@ -425,8 +426,8 @@ python -m trendmodel.train prepare \
   --mode both
 ```
 
-公共数据的 intent 等弱标签可能来自同一个 `TaskTagger` teacher，因此 `fused` 对
-公共数据的高分不能替代独立 gold 评估。训练时还会把 validation raw 指标与保存后
+公共数据的 intent 等弱标签可能来自同一个 `TaskTagger` teacher，因此这些标签本身
+不能替代独立 gold 评估。训练时还会把 validation raw 指标与保存后
 重新加载 artifact 的 raw 指标做 round-trip 对照；如果差异明显，metadata 的
 `warnings` 会提示不要直接发布该 artifact。
 

@@ -241,7 +241,7 @@ python3 -m trendmodel.tf_train predict \
   "帮我实现一个 C++ 多线程程序"
 ```
 
-模型是 `TextVectorization(character) + Embedding + BiGRU + character n-gram TF-IDF branch + structured feature branch + multi-task heads`，同时预测 workload、intent、complexity、effort bucket、effort minutes 和是否需要澄清。训练时对稀有类别使用 capped inverse-sqrt sample weighting，避免 `low` 或多数 workload 把 head 吸成单一类别；可信的人工/种子标签默认通过 `--gold-replay-multiplier 8` 做训练 replay，避免公共 weak/pseudo 数据淹没内部 gold。结构分支显式接收代码块、文件、Shell、语言、工具/执行和风险等确定性信号；它与推理时的 evidence fusion 使用同一套 extractor。缺失字段通过 sample weight mask；公共数据可以训练分类头，但没有真实 effort supervision 时不会伪造分钟真值。保存的 artifact 包括 `model.keras` 和 `metadata.json`，推理 JSON 在保留旧 scalar 字段的同时，新增 `predictions` 概率结构和 effort bucket candidates，方便 router 使用候选和置信度。旧的 text-only artifact 仍可加载，新训练产物使用模型版本 `0.3.0`。
+模型是 `TextVectorization(character) + Embedding + BiGRU + character n-gram TF-IDF branch + integrated TaskAST feature branch + multi-task heads`，同时预测 workload、intent、complexity、effort bucket、effort minutes 和是否需要澄清。训练时对稀有类别使用 capped inverse-sqrt sample weighting，避免 `low` 或多数 workload 把 head 吸成单一类别；可信的人工/种子标签默认通过 `--gold-replay-multiplier 8` 做训练 replay，避免公共 weak/pseudo 数据淹没内部 gold。TaskAST 在训练和推理时都作为 TensorFlow 的结构化输入特征，推理 JSON 原样返回可审计 evidence，但不会再由 TaskTagger 或规则对 TensorFlow 概率做 post-hoc fusion。缺失字段通过 sample weight mask；公共数据可以训练分类头，但没有真实 effort supervision 时不会伪造分钟真值。保存的 artifact 包括 `model.keras` 和 `metadata.json`，推理 JSON 在保留旧 scalar 字段的同时，新增 `predictions` 概率结构和 effort bucket candidates，方便 router 使用候选和置信度。旧的 text-only artifact 仍可加载，新训练产物使用模型版本 `0.3.0`。
 
 当前仓库的默认解释器是 Python 3.14。它可以运行清洗、TaskTagger 和 Hugging Face `datasets` 4/5 系列，但仓库固定的 TensorFlow 2.16.2 没有 Python 3.14 wheel。本机真正训练需要单独准备 Python 3.11/3.12 环境，再按硬件安装对应 runtime；这不是代码训练失败，而是运行时 wheel 约束。
 
@@ -303,8 +303,8 @@ PY
 
 ### 评估口径
 
-评估默认只看固定的 validation split，并同时输出 raw neural head 和下游 fused
-结果：
+评估默认只看固定的 validation split，并同时输出 raw neural head 和 production
+inference contract；两者都使用训练好的 TensorFlow heads 和内置 TaskAST feature branch：
 
 ```bash
 .venv-tf/bin/python -m trendmodel.train evaluate \
@@ -316,8 +316,9 @@ PY
 
 其中：
 
-- `--mode raw`：只评估 TensorFlow 神经网络，不调用 `TaskTagger`；
-- `--mode fused`：评估下游实际看到的结构化证据融合结果；
+- `--mode raw`：评估 TensorFlow heads 的结果；TaskAST 已经在模型输入中，不做 post-hoc fusion；
+- `--mode inference`：评估生产 JSON，额外返回 TaskAST evidence，但不修改概率；
+- `--mode fused`：兼容旧命令的别名，实际等同于 `inference`，不再执行旧的概率融合；
 - `--split validation`：默认的留出集；
 - `--split all`：只用于数据诊断，包含训练样本，不能当作泛化指标。
 

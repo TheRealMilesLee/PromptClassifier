@@ -19,6 +19,7 @@ from .tf_inference import TensorFlowTaskModel
 from .tf_model import build_text_model, require_tensorflow
 from .tf_features import STRUCTURED_FEATURE_NAMES
 from .tf_runtime import inspect_tensorflow_runtime
+from .task_ast import TaskAST
 
 
 def train_model(
@@ -123,7 +124,9 @@ def train_model(
     metadata = {
         "model_id": "trendmodel-text-v1",
         "model_version": "0.3.0",
-        "architecture": "TextVectorization(character) + Embedding + BiGRU + character n-gram TF-IDF branch + structured feature branch + multi-task heads (including effort bucket) + evidence fusion",
+        "architecture": "TextVectorization(character) + Embedding + BiGRU + character n-gram TF-IDF branch + integrated TaskAST feature branch + multi-task heads (including effort bucket)",
+        "task_ast_schema": TaskAST.schema_version,
+        "post_hoc_probability_fusion": False,
         "text_encoder": {
             "character_max_tokens": 12_000,
             "character_sequence_length": 192,
@@ -184,7 +187,7 @@ def evaluate_tensorflow_model(
     model: TensorFlowTaskModel,
     records: Iterable[Any],
     *,
-    mode: str = "fused",
+    mode: str = "inference",
     batch_size: int = 128,
 ) -> dict[str, Any]:
     """Evaluate classification heads and effort on available labels.
@@ -194,14 +197,16 @@ def evaluate_tensorflow_model(
     teacher but cannot supervise effort.  Metrics are intentionally kept in
     this dependency-free module instead of requiring scikit-learn.
 
-    ``raw`` evaluates only the saved neural heads.  ``fused`` evaluates the
-    downstream contract, including the structural TaskTagger.  They must be
-    reported separately because public labels may themselves come from that
-    teacher.
+    ``raw`` evaluates the saved neural heads.  ``inference`` evaluates the
+    production contract, which returns the same probabilities plus TaskAST
+    evidence.  No mode applies post-hoc probability fusion.  ``fused`` is
+    accepted as a backwards-compatible alias for ``inference``.
     """
 
-    if mode not in {"raw", "fused"}:
-        raise ValueError("mode must be 'raw' or 'fused'")
+    if mode == "fused":
+        mode = "inference"
+    if mode not in {"raw", "inference"}:
+        raise ValueError("mode must be 'raw' or 'inference'")
     records = list(records)
     prompts = [record.original_prompt for record in records]
     if mode == "raw":
@@ -430,8 +435,10 @@ def evaluate_saved_model(
 
     if split not in {"all", "train", "validation"}:
         raise ValueError("split must be 'all', 'train', or 'validation'")
-    if mode not in {"raw", "fused", "both"}:
-        raise ValueError("mode must be 'raw', 'fused', or 'both'")
+    if mode == "fused":
+        mode = "inference"
+    if mode not in {"raw", "inference", "both"}:
+        raise ValueError("mode must be 'raw', 'inference', or 'both'")
 
     records = load_task_records(data_path)
     if split == "all":
@@ -445,7 +452,7 @@ def evaluate_saved_model(
         selected_records = train_records if split == "train" else validation_records
 
     model = TensorFlowTaskModel.load(artifact_dir)
-    modes = ("raw", "fused") if mode == "both" else (mode,)
+    modes = ("raw", "inference") if mode == "both" else (mode,)
     evaluations = {
         current_mode: evaluate_tensorflow_model(
             model,
@@ -456,8 +463,8 @@ def evaluate_saved_model(
         for current_mode in modes
     }
     warnings = [
-        "raw evaluates neural heads without structural evidence fusion",
-        "fused includes TaskTagger structural evidence and is not an independent teacher-free metric",
+        "raw and inference both use the integrated TaskAST feature branch",
+        "inference adds auditable TaskAST evidence to the JSON contract; it does not alter probabilities after the TensorFlow heads",
     ]
     if split == "all":
         warnings.append("all includes training records; use split=validation for a holdout estimate")
@@ -512,9 +519,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     evaluate.add_argument(
         "--mode",
-        choices=("raw", "fused", "both"),
+        choices=("raw", "inference", "fused", "both"),
         default="both",
-        help="raw neural heads, fused downstream contract, or both",
+        help="raw neural heads, production inference contract, legacy fused alias, or both",
     )
     evaluate.add_argument("--validation-ratio", type=float, default=0.2)
     evaluate.add_argument("--seed", type=int, default=42)

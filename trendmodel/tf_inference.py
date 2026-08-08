@@ -14,9 +14,10 @@ from .tf_data import (
     bucket_from_minutes,
     normalize_model_text,
 )
-from .tf_features import structured_feature_matrix
+from .evidence import extract_evidence
+from .task_ast import TaskAST
+from .tf_features import structured_feature_matrix_from_asts, structured_feature_matrix
 from .tf_model import require_tensorflow
-from .tagger import TaskTagger
 
 
 class TensorFlowTaskModel:
@@ -33,12 +34,6 @@ class TensorFlowTaskModel:
         self.structured_feature_dim = int(metadata.get("structured_feature_dim", 0) or 0)
         output_names = getattr(model, "output_names", ())
         self.has_effort_bucket_head = "effort_bucket" in output_names
-        # The TensorFlow heads learn the prompt distribution.  This compact,
-        # dependency-free teacher contributes only high-confidence structured
-        # evidence (language, explicit action, command/file signals, etc.) at
-        # inference time.  It is the evidence-fusion layer of the router
-        # design, not a replacement for the trained model.
-        self.structural_tagger = TaskTagger()
 
     @classmethod
     def load(cls, artifact_dir: str | Path) -> "TensorFlowTaskModel":
@@ -58,31 +53,16 @@ class TensorFlowTaskModel:
         if not str(prompt).strip():
             raise ValueError("prompt must not be empty")
         prompt = str(prompt)
-        raw = self.model.predict(self._model_inputs([prompt]), verbose=0)
+        task_ast = extract_evidence(prompt)
+        raw = self.model.predict(
+            self._model_inputs([prompt], task_asts=[task_ast]),
+            verbose=0,
+        )
 
         workload_probabilities = _probabilities(raw, "workload_type")
         intent_probabilities = _probabilities(raw, "intent")
         complexity_probabilities = _probabilities(raw, "complexity")
-        structural = self.structural_tagger.predict(prompt).to_dict()
-        structural_evidence = structural.get("evidence", [])
-        workload_probabilities = _fuse_structural_evidence(
-            workload_probabilities,
-            self.workload_labels,
-            structural.get("workload_type", {}).get("label"),
-            _evidence_strength(structural_evidence, {"language", "operation", "domain_hint", "constraint"}),
-        )
-        intent_probabilities = _fuse_structural_evidence(
-            intent_probabilities,
-            self.intent_labels,
-            structural.get("intent", {}).get("label"),
-            _evidence_strength(structural_evidence, {"intent_hint"}),
-        )
-        complexity_probabilities = _fuse_structural_evidence(
-            complexity_probabilities,
-            self.complexity_labels,
-            structural.get("complexity", {}).get("label"),
-            _evidence_strength(structural_evidence, {"language", "operation", "constraint", "intent_hint"}),
-        )
+        structural_evidence = [item.to_dict() for item in task_ast.evidence]
         workload_type = self.workload_labels[_argmax(workload_probabilities)]
         intent = self.intent_labels[_argmax(intent_probabilities)]
         complexity = self.complexity_labels[_argmax(complexity_probabilities)]
@@ -90,9 +70,6 @@ class TensorFlowTaskModel:
         clarification_probability = float(_first_value(raw, "needs_clarification"))
         reasons = _clarification_reasons(prompt, clarification_probability)
         needs_clarification = bool(reasons) or clarification_probability >= 0.5
-        if needs_clarification and not structural_evidence:
-            workload_type = "unknown"
-            intent = "unknown"
 
         workload_confidence = max(workload_probabilities)
         intent_confidence = max(intent_probabilities)
@@ -149,8 +126,9 @@ class TensorFlowTaskModel:
             "evidence": structural_evidence,
             "fusion": {
                 "semantic_model": self.model_id,
-                "structural_teacher": getattr(self.structural_tagger, "model_version", "unknown"),
-                "policy": "neural probabilities plus high-confidence structured evidence",
+                "task_ast_schema": task_ast.schema_version,
+                "post_hoc_probability_fusion": False,
+                "policy": "TensorFlow consumes TaskAST features internally; inference returns evidence without post-hoc probability fusion",
             },
             "effort": {
                 "bucket": effort_payload["label"],
@@ -194,8 +172,10 @@ class TensorFlowTaskModel:
         if not prompts:
             return []
 
+        prompt_values = [str(prompt) for prompt in prompts]
+        task_asts = [extract_evidence(prompt) for prompt in prompt_values]
         raw = self.model.predict(
-            self._model_inputs([str(prompt) for prompt in prompts]),
+            self._model_inputs(prompt_values, task_asts=task_asts),
             batch_size=batch_size,
             verbose=0,
         )
@@ -208,11 +188,17 @@ class TensorFlowTaskModel:
                 self.complexity_labels,
                 self.metadata,
                 effort_bucket_labels=self.effort_bucket_labels,
+                evidence=[item.to_dict() for item in task_asts[index].evidence],
             )
-            for index, prompt in enumerate(prompts)
+            for index, prompt in enumerate(prompt_values)
         ]
 
-    def _model_inputs(self, prompts: list[str]) -> Any:
+    def _model_inputs(
+        self,
+        prompts: list[str],
+        *,
+        task_asts: list[TaskAST] | None = None,
+    ) -> Any:
         """Build inputs for both new two-branch and legacy text-only artifacts."""
 
         tf = require_tensorflow()
@@ -220,7 +206,12 @@ class TensorFlowTaskModel:
         text_input = tf.constant(normalized)
         if self.structured_feature_dim <= 0:
             return text_input
-        features = structured_feature_matrix(prompts)
+        if task_asts is None:
+            features = structured_feature_matrix(prompts)
+        else:
+            if len(task_asts) != len(prompts):
+                raise ValueError("task_asts must have the same length as prompts")
+            features = structured_feature_matrix_from_asts(task_asts)
         return {
             "original_prompt": text_input,
             "structured_features": tf.constant(features, dtype=tf.float32),
@@ -268,6 +259,7 @@ def _raw_prediction_payload(
     metadata: Mapping[str, Any],
     *,
     effort_bucket_labels: list[str] | None = None,
+    evidence: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Build the evaluation contract from neural outputs only."""
 
@@ -316,6 +308,7 @@ def _raw_prediction_payload(
             "confidence": effort_payload["confidence"],
             "basis": effort_payload["basis"],
         },
+        "evidence": list(evidence or []),
         "needs_clarification": clarification_probability >= 0.5,
         "confidence": {
             "workload_type": round(max(workload_probabilities), 4),
@@ -332,8 +325,9 @@ def _raw_prediction_payload(
         },
         "fusion": {
             "semantic_model": metadata.get("model_id", "trendmodel-text-v1"),
-            "structural_teacher": None,
-            "policy": "raw neural probabilities without structural evidence fusion",
+            "task_ast_schema": metadata.get("task_ast_schema", TaskAST.schema_version),
+            "post_hoc_probability_fusion": False,
+            "policy": "TensorFlow consumes TaskAST features internally; raw output exposes neural probabilities without post-hoc fusion",
         },
     }
 
@@ -509,49 +503,6 @@ def _effort_payload_from_raw(
         "confidence": round(effort_confidence, 4),
         "basis": effort_basis,
     }
-
-
-def _evidence_strength(evidence: Any, kinds: set[str]) -> float:
-    """Return the strongest structured signal for a fusion head."""
-
-    strongest = 0.0
-    if not isinstance(evidence, list):
-        return strongest
-    for signal in evidence:
-        if not isinstance(signal, dict) or signal.get("kind") not in kinds:
-            continue
-        try:
-            strongest = max(strongest, float(signal.get("strength", 0.0)))
-        except (TypeError, ValueError):
-            continue
-    return max(0.0, min(1.0, strongest))
-
-
-def _fuse_structural_evidence(
-    probabilities: list[float],
-    labels: list[str],
-    structural_label: Any,
-    strength: float,
-) -> list[float]:
-    """Apply a bounded one-class likelihood boost from explicit evidence.
-
-    The neural distribution is retained as the base prior.  A high-confidence
-    structural observation contributes at most 72% of the posterior, so an
-    evidence extractor cannot silently turn every request into a hard rule.
-    """
-
-    if structural_label not in labels or strength <= 0.0:
-        return probabilities
-    alpha = min(0.72, 0.72 * strength)
-    fused = [
-        (1.0 - alpha) * float(probability)
-        + (alpha if label == structural_label else 0.0)
-        for label, probability in zip(labels, probabilities)
-    ]
-    total = sum(fused)
-    if total <= 0.0:
-        return probabilities
-    return [value / total for value in fused]
 
 
 def _effort_head_is_supervised(metadata: dict[str, Any]) -> bool:

@@ -281,9 +281,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     evaluate.add_argument(
         "--mode",
-        choices=("raw", "fused", "both"),
+        choices=("raw", "inference", "fused", "both"),
         default="both",
-        help="raw neural heads, fused downstream contract, or both",
+        help="raw neural heads, production inference contract, legacy fused alias, or both",
     )
     evaluate.add_argument("--validation-ratio", type=float, default=0.2)
     evaluate.add_argument("--seed", type=int, default=42)

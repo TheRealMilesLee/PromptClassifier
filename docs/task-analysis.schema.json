@@ -41,10 +41,16 @@
     },
     "fusion": {
       "type": "object",
-      "required": ["semantic_model", "structural_teacher", "policy"],
+      "required": [
+        "semantic_model",
+        "task_ast_schema",
+        "post_hoc_probability_fusion",
+        "policy"
+      ],
       "properties": {
         "semantic_model": {"type": "string"},
-        "structural_teacher": {"type": "string"},
+        "task_ast_schema": {"type": "string"},
+        "post_hoc_probability_fusion": {"type": "boolean"},
         "policy": {"type": "string"}
       },
       "additionalProperties": true

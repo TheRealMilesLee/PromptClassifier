@@ -6,9 +6,9 @@
 
 本文定义 TrendModel 的问题边界、数据流、模型结构和推理算法。TrendModel 的输入是一段用户 prompt，输出是面向 Auto Router 的结构化任务分析，而不是最终答案。系统需要同时判断用户意图、workload 类型、复杂度、粗粒度 effort、是否需要澄清，以及代码、文件、命令、工具和风险等可观测约束。
 
-本文采用“语义表示 + TaskAST 结构化证据 + Bayesian-style 融合 + Task IR”的分层设计。这里的 `TaskAST` 是正式的 Python dataclass，但它不是编程语言语法树，而是面向任务路由的结构化中间层。文本编码器负责理解自然语言整体语义；结构化解析器负责提取代码块、语言、路径、命令、操作和风险等确定性信号；融合层负责组合不同来源的证据并管理不确定性；Task IR 则作为下游 Router 的稳定接口。贝叶斯方法在本系统中不是中文语义理解器，也不是一个独立的训练模型，而是位于分类输出之后的证据融合和置信度管理层。
+本文采用“语义表示 + TaskAST 结构化证据 + Bayesian-style 证据管理 + Task IR”的分层设计。这里的 `TaskAST` 是正式的 Python dataclass，但它不是编程语言语法树，而是面向任务路由的结构化中间层。文本编码器负责理解自然语言整体语义；结构化解析器负责提取代码块、语言、路径、命令、操作和风险等确定性信号；TaskAST 在当前 TensorFlow 主模型中直接编码成输入特征，同时作为 evidence 原样返回。贝叶斯方法在本系统中不是中文语义理解器，也不是当前 TensorFlow 推理阶段的第二次概率修正；它保留在 prototype `TaskTagger` 的可选证据融合、以及未来的校准/上下文更新层。
 
-当前 TensorFlow 主模型使用字符级 `BiGRU`、字符 n-gram `TF-IDF`、56 维结构化特征分支和多任务 heads。系统还保留了一个可插拔的句向量 + 原型分类路径，作为解释性 TaskTagger 和结构化 evidence teacher。文档同时区分当前已实现能力、概念架构和待补齐的数据/标注能力，避免把弱标签、规则分数或未经校准的 probability 误写成真实准确率。
+当前 TensorFlow 主模型使用字符级 `BiGRU`、字符 n-gram `TF-IDF`、56 维 TaskAST 结构化特征分支和多任务 heads。系统还保留了一个可插拔的句向量 + 原型分类路径，作为解释性 TaskTagger 和独立 prototype。文档同时区分当前已实现能力、概念架构和待补齐的数据/标注能力，避免把弱标签、规则分数或未经校准的 probability 误写成真实准确率。
 
 ## 关键词
 
@@ -573,7 +573,7 @@ Task IR 的设计原则是：
 
 ### 3.5 从输入到输出的算法链路
 
-下面的伪代码描述完整的推理链路。`TaskAST` 保存结构化 evidence；`BayesianFuse` 是 Bayesian-style 的受限近似，而不是已校准的严格后验。
+下面的伪代码描述当前 TensorFlow 主链路。`TaskAST` 保存结构化 evidence；Bayesian-style 融合只属于可选 prototype/未来校准层，不在当前 TensorFlow `predict` 中二次修改分类概率。
 
 ```text
 Algorithm 1: TrendModelAnalyze(prompt, optional_context)
@@ -597,21 +597,17 @@ Output:
 8.  p_raw ← MultiTaskHeads(h)
     where heads = workload, intent, complexity, effort_bucket,
     effort_log_minutes and needs_clarification.
-9.  t ← TaskTagger evidence teacher on x_raw
-    (prototype similarity + deterministic extractor).
-10. For workload, intent and complexity:
-       p_fused ← BayesianStyleFuse(p_raw, t, z)
-       using the head-specific evidence policy.
-11. effort ← ConvertEffortHeads(p_raw, complexity, observed_effort_metadata)
-12. uncertainty ← Compute(probability, entropy, margin, overall_confidence)
-13. if clarification policy is triggered and no usable evidence exists:
-       downgrade workload/intent to unknown.
-14. y ← BuildTaskIRJSON(x_raw, predictions, effort, evidence,
+9.  evidence ← Serialize(A.evidence)
+    # return the observable TaskAST signals; do not alter p_raw.
+10. effort ← ConvertEffortHeads(p_raw, complexity, observed_effort_metadata)
+11. uncertainty ← Compute(probability, entropy, margin, overall_confidence)
+12. clarification ← ApplyClarificationPolicy(p_raw, x_raw)
+13. y ← BuildTaskIRJSON(x_raw, predictions=p_raw, effort, evidence,
                          fusion_metadata, uncertainty)
-15. return y
+14. return y
 ```
 
-步骤 4 和步骤 9 使用同一套结构化 extractor，减少训练/推理特征漂移；步骤 10 只对指定 head 融合指定证据，不让一个 Python 标记无差别地改变所有分类；步骤 11 单独处理 effort，避免把 bucket midpoint 伪装成真实工作时间。需要注意，算法中的 `TaskTagger` teacher 是当前 TensorFlow 推理路径使用的高置信结构证据来源；它不是第二个最终模型，不能把两个模型的 probability 直接平均。
+步骤 3 先生成一份 TaskAST；步骤 4 把这份 AST 编码成 56 维结构化输入，步骤 9 返回同一份 AST 的 evidence，避免训练输入和审计输出来自两套规则。步骤 10–12 都不会把证据再混入分类概率；`needs_clarification` 是独立的路由安全信号。旧的 `TaskTagger` 仍可作为 prototype 运行，但不再是 TensorFlow 主推理的第二个概率来源。
 
 核心思想不是用一个算法解决所有问题，而是给不同类型的信号分配不同的责任：
 
@@ -625,8 +621,8 @@ Output:
 
 当前代码中有两条互补的实现路径，不能把它们当成同一个模型：
 
-- `TaskTagger` 是原型分类和 evidence teacher。它可以接入真正的中文/多语言句向量模型，也可以使用默认的无依赖 `HashEmbedder`；它负责原型相似度、结构化提取和解释性 Task IR。
-- `TensorFlowTaskModel` 是当前主要训练和部署的 artifact。它使用字符级 BiGRU、字符 n-gram TF-IDF、结构化特征和多任务 heads，输出下游约定的 JSON。推理时，它只把 `TaskTagger` 的高置信结构化信号作为 teacher evidence 融入，不把两个模型的概率直接混在一起。
+- `TaskTagger` 是可选的 prototype 分类器。它可以接入真正的中文/多语言句向量模型，也可以使用默认的无依赖 `HashEmbedder`；它负责原型相似度、可选的 Bayesian-style 证据融合和解释性 Task IR。
+- `TensorFlowTaskModel` 是当前主要训练和部署的 artifact。它使用字符级 BiGRU、字符 n-gram TF-IDF、TaskAST 结构化特征和多任务 heads，输出下游约定的 JSON。推理时，TaskAST 只作为模型输入并以 evidence 返回，TensorFlow 概率不再经过 TaskTagger 或规则的 post-hoc 修改。
 
 因此，“句向量 + 原型分类”是系统的语义 teacher/演进方向；“字符级轻量模型 + 结构化分支”是目前可在 M4 和 RTX 4070 本地训练、保存和跨平台加载的 TensorFlow 主模型。这样既保留了未来替换语义 encoder 的空间，也不会让第一版训练依赖一个额外的在线或大型预训练模型。
 
@@ -698,7 +694,7 @@ p_neural(operations) = 0.35
 p_neural(text)       = 0.25
 ```
 
-TaskAST/结构化 teacher 发现了高置信的 Kubernetes、Shell 命令和生产环境信号，因此把结构标签暂时归纳为 `operations`，并估计 `evidence_strength = 0.90`。当前 TensorFlow 推理实现使用一个受限的证据修正：
+TaskAST 发现了高置信的 Kubernetes、Shell 命令和生产环境信号，因此可以在 evidence 层记录 `operations` 候选，并估计 `evidence_strength = 0.90`。下面的数值只用于解释“如果未来启用 Bayesian-style post-hoc fusion 会发生什么”；当前 TensorFlow 推理不执行这一步：
 
 ```text
 α = min(0.72, 0.72 × evidence_strength)
@@ -716,14 +712,14 @@ p_fused(code)       = 0.352 × 0.40 + 0.648 × 0.00 = 0.1408
 p_fused(text)       = 0.352 × 0.25 + 0.648 × 0.00 = 0.0880
 ```
 
-这说明了两个设计决策：
+这说明了 prototype/未来设计中的两个决策：
 
 - 结构化证据能够把“明显的运维请求”从 `code=0.40` 的模糊 raw 输出拉向 `operations`；
 - 结构证据最多占有限比例，仍然保留神经模型的 35.2% 权重，因此规则不会无条件覆盖语义模型。
 
 这里的 `0.7712` 是融合后的 posterior-like 分数，不是经过独立人工 gold 集校准后的真实正确率。只有当我们收集独立 gold 数据并进行 calibration 后，才可以讨论“预测为 0.8 的样本大约有多少比例正确”。
 
-### 4.3 当前实现：Bayesian-style，而不是严格 Bayes 模型
+### 4.3 可选 prototype：Bayesian-style，而不是严格 Bayes 模型
 
 当前实现并没有假设所有概率都已经严格校准，也没有假设文本、规则和上下文之间相互独立，而是采用两种受限的 Bayesian-style 近似。
 
@@ -737,12 +733,14 @@ p_mix = 0.70 × p_semantic
 
 缺失的 evidence source 使用均匀分布作为中性输入，避免“没有检测到 Shell 命令”被错误地解释成“肯定不是 Shell”。代码中还保留了乘法型的 `P(class | evidence) ∝ likelihood × prior` 实验实现，但默认没有启用，因为稀疏规则证据可能造成过度收缩。
 
-TensorFlow 对外推理路径不接收 context prior，因此使用更保守的结构化证据修正：
+历史设计曾考虑在 TensorFlow 对外推理路径使用更保守的结构化证据修正：
 
 ```text
 p_fused = (1 - α) × p_neural + α × one_hot(structural_label)
 α = min(0.72, 0.72 × evidence_strength)
 ```
+
+P0 方案 A 已经关闭这条 post-hoc 路径。当前 TensorFlow 对外行为是：`TaskAST → 56 维输入 → TensorFlow heads`，然后返回 `TaskAST.evidence`；`fusion.post_hoc_probability_fusion` 固定为 `false`。上式和后续融合示例仅保留用于解释 prototype `TaskTagger` 与未来实验，不代表当前 artifact 的输出公式。
 
 这意味着结构化证据最多可以占据有限比例的后验，不会无条件覆盖神经模型。这样做有两个原因：
 
@@ -1083,9 +1081,9 @@ flowchart LR
 
 没有 `split_group` 时，loader 会把每条记录当作独立 group；这在效果上等同于 record-level deterministic split，但仍然保持同一套切分逻辑。
 
-## 12. 推理阶段的证据融合
+## 12. 推理阶段的 TaskAST 输入与 evidence 输出
 
-TensorFlow raw model 先输出神经 head 的原始 posterior。实际对外的 `predict` contract 再调用结构化 teacher，提取：
+TensorFlow `predict` 先从原始 prompt 提取 TaskAST，然后把同一份 AST 编码为结构化输入，与字符序列和 n-gram 分支一起送入模型。模型输出神经 heads 后，contract 返回同一份 TaskAST 的 observable evidence：
 
 - 语言；
 - intent hint；
@@ -1098,7 +1096,9 @@ TensorFlow raw model 先输出神经 head 的原始 posterior。实际对外的 
 - 高风险信号；
 - DNS、Kubernetes、数据库、部署、测试等 operations。
 
-不同 head 使用不同 evidence：
+这些 evidence 不会在推理阶段被再次混入概率。它们的作用是让 Router 能审计模型看到了哪些高置信结构信号；不同 head 的最终概率由训练时学到的多任务 heads 产生。effort 仍由 effort bucket/regression heads 和 metadata supervision basis 共同解释。
+
+历史 prototype 的 head-specific evidence policy 如下，仅用于 `TaskTagger` 或后续实验：
 
 | Head | 参与融合的 evidence |
 | --- | --- |
@@ -1107,7 +1107,7 @@ TensorFlow raw model 先输出神经 head 的原始 posterior。实际对外的 
 | complexity | language、operation、constraint、intent hint |
 | effort | effort bucket head、complexity posterior、observed effort metadata |
 
-这样可以避免一个结构化信号无差别地修改所有分类。例如，出现 Python 并不意味着任务一定是创建代码；它只能提高代码相关 workload 或 complexity 的先验。
+当前主模型不再执行上述 post-hoc 修改；这也避免了同一份 TaskAST 在训练输入和推理后处理阶段被重复计权。
 
 ## 13. 概率和不确定性
 
@@ -1186,21 +1186,21 @@ python -m trendmodel.train evaluate ...
 
 ### Raw evaluation
 
-Raw evaluation 只调用 TensorFlow 神经 head，不调用结构化 teacher。它用于回答：
+Raw evaluation 评估 TensorFlow heads 的输出；这些 heads 本身已经接收 TaskAST 结构化输入。它用于回答：
 
 ```text
 保存下来的 TensorFlow 模型本身学到了什么？
 ```
 
-### Fused evaluation
+### Inference evaluation
 
-Fused evaluation 调用实际推理路径中的结构化证据融合。它用于回答：
+Inference evaluation 调用生产 `predict` contract。它返回与 raw 相同的 head 概率，并附带同一份 TaskAST evidence，用于回答：
 
 ```text
 下游 Router 实际会看到什么？
 ```
 
-如果公共数据的标签本身来自同一个 TaskTagger teacher，那么 fused 在这些数据上的高分不能作为独立质量证明，因为 teacher 可能同时参与了标签生成和评估。
+旧命令 `--mode fused` 仍作为兼容别名，但实际等同于 inference，不再代表概率融合。如果公共数据的标签本身来自同一个 TaskTagger teacher，那么这些标签仍不能作为独立质量证明，因为 teacher 可能参与了标签生成。
 
 ### 当前指标
 
@@ -1275,7 +1275,7 @@ artifacts/trendmodel-text-v1/
 
 - 在 RTX 4070 上完成 CUDA device check；
 - 用 curated hard-negative 数据完成 2 epoch smoke；
-- 验证 train、save、load、raw evaluate、fused evaluate、predict 全链路；
+- 验证 train、save、load、raw/inference evaluate、predict 全链路；
 - 对比 M4 Metal 和 CUDA 的速度及 metadata。
 
 ### 阶段二：数据和标签质量
@@ -1487,10 +1487,10 @@ record with observed active_minutes:
 
 每次训练至少报告两条路径：
 
-- `raw`：只运行保存后的 TensorFlow heads，回答“神经模型本身学到了什么”；
-- `fused`：加入 TaskTagger evidence，回答“下游 Router 实际看到什么”。
+- `raw`：运行保存后的 TensorFlow heads，回答“神经模型本身学到了什么”；
+- `inference`：返回生产 JSON 和 TaskAST evidence，回答“下游 Router 实际看到什么”；概率与 raw 保持一致。
 
-两者不能混为一个分数。若训练标签本身由 TaskTagger 生成，则 fused 评估会存在 teacher overlap，只能作为集成链路检查，不能作为独立泛化证明。最终发布需要独立的 `data/gold_validation.jsonl`，报告 accuracy、macro-F1、按 source/label quality 分组的指标、effort bucket accuracy、observed MAE 和 unknown/OOD 指标。
+两者不是两套分类器，也不应期待 inference 比 raw 自动更准；它们主要用于检查输出 contract 和 evidence 是否完整。若训练标签本身由 TaskTagger 生成，仍然存在 teacher overlap，不能作为独立泛化证明。最终发布需要独立的 `data/gold_validation.jsonl`，报告 accuracy、macro-F1、按 source/label quality 分组的指标、effort bucket accuracy、observed MAE 和 unknown/OOD 指标。
 
 ## 22. 代码组成与运行时调用关系
 
@@ -1512,13 +1512,13 @@ record with observed active_minutes:
 | `trendmodel/tf_data.py` | TaskRecord、label map、split、类别权重、sample-weight mask、tf.data | 是 |
 | `trendmodel/tf_model.py` | Keras 模型结构、loss、optimizer 和 head | 是 |
 | `trendmodel/tf_train.py` | TensorFlow train/evaluate、保存、reload、metadata | 是 |
-| `trendmodel/tf_inference.py` | artifact load、raw/fused predict、effort 转换、JSON contract | 是 |
+| `trendmodel/tf_inference.py` | artifact load、raw/inference predict、TaskAST evidence、effort 转换和 JSON contract | 是 |
 | `trendmodel/api.py` | 本地 OpenAI-compatible HTTP 包装 | 可选 serving 层 |
 | `trendmodel/model.py`、`nb.py`、`vectorizer.py` | 旧版 TF-IDF + 多头 Naive Bayes baseline | 兼容保留，不是当前主 artifact |
 
 ### 22.2 训练与推理时的代码边界
 
-训练阶段，`tf_features.structured_feature_vector()` 调用 `evidence.extract_evidence()` 得到 `TaskAST`，再把其中的规则事实编码进 56 维结构化输入；`tf_model.build_text_model()` 再把文本分支和结构分支融合，训练六个 heads。推理阶段，`tf_inference.TensorFlowTaskModel` 先取得 raw heads，再调用 `TaskTagger` 获取高置信 evidence，对 workload、intent、complexity 做受限融合，最后构造 JSON。实现细节见 [`trendmodel/tf_features.py`](../trendmodel/tf_features.py)、[`trendmodel/tf_model.py`](../trendmodel/tf_model.py)、[`trendmodel/tf_inference.py`](../trendmodel/tf_inference.py) 和 [`trendmodel/tagger.py`](../trendmodel/tagger.py)。
+训练阶段，`tf_features.structured_feature_vector()` 调用 `evidence.extract_evidence()` 得到 `TaskAST`，再把其中的规则事实编码进 56 维结构化输入；`tf_model.build_text_model()` 再把文本分支和结构分支融合，训练六个 heads。推理阶段，`tf_inference.TensorFlowTaskModel` 提取一份 TaskAST，将它编码进模型输入，并把同一份 AST 的 evidence 放进 JSON；不会再调用 `TaskTagger` 修改概率。实现细节见 [`trendmodel/tf_features.py`](../trendmodel/tf_features.py)、[`trendmodel/tf_model.py`](../trendmodel/tf_model.py)、[`trendmodel/tf_inference.py`](../trendmodel/tf_inference.py) 和 [`trendmodel/tagger.py`](../trendmodel/tagger.py)。
 
 这条边界有三个工程含义：
 
@@ -1611,7 +1611,7 @@ Salesforce AI Research. (n.d.). *xLAM function calling 60K* [Data set]. Hugging 
 - [`trendmodel/tf_features.py`](../trendmodel/tf_features.py)：56 维结构化特征向量。
 - [`trendmodel/tf_model.py`](../trendmodel/tf_model.py)：字符向量化、BiGRU、n-gram TF-IDF、结构分支和多任务 heads。
 - [`trendmodel/tf_data.py`](../trendmodel/tf_data.py)：记录解析、label map、group split、类别平衡、replay 和 sample-weight mask。
-- [`trendmodel/tf_inference.py`](../trendmodel/tf_inference.py)：raw/fused 推理、effort basis、uncertainty diagnostics 和 JSON contract。
+- [`trendmodel/tf_inference.py`](../trendmodel/tf_inference.py)：raw/inference 推理、TaskAST evidence、effort basis、uncertainty diagnostics 和 JSON contract。
 - [`trendmodel/tf_train.py`](../trendmodel/tf_train.py)：训练、评估、保存、reload round-trip 和 metadata。
 - [`trendmodel/train.py`](../trendmodel/train.py)、[`trendmodel/public_data.py`](../trendmodel/public_data.py)、[`trendmodel/local_data.py`](../trendmodel/local_data.py)、[`trendmodel/data_cleaning.py`](../trendmodel/data_cleaning.py)：本地数据准备、adapter 和清洗边界。
 

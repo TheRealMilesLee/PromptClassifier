@@ -17,6 +17,7 @@ import re
 from typing import Iterable
 
 from .evidence import extract_evidence
+from .task_ast import TaskAST
 
 
 _LANGUAGES = (
@@ -96,14 +97,19 @@ STRUCTURED_FEATURE_NAMES = (
 def structured_feature_vector(text: str) -> list[float]:
     """Return a stable, bounded feature vector for one prompt."""
 
-    original = str(text)
+    return structured_feature_vector_from_ast(extract_evidence(str(text)))
+
+
+def structured_feature_vector_from_ast(task_ast: TaskAST) -> list[float]:
+    """Encode one already-extracted :class:`TaskAST` without re-parsing it."""
+
+    original = task_ast.original_prompt
     compact = re.sub(r"\s+", "", original)
     total = max(len(compact), 1)
     cjk_count = len(re.findall(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]", compact))
     latin_count = len(re.findall(r"[A-Za-z]", compact))
     digit_count = len(re.findall(r"\d", compact))
-    evidence = extract_evidence(original)
-    constraints = evidence.constraints
+    constraints = task_ast.constraints
 
     values = [
         _bounded_log(len(compact), 10.0),
@@ -118,14 +124,14 @@ def structured_feature_vector(text: str) -> list[float]:
         float(constraints.has_urls),
         float(constraints.requires_files),
         float(constraints.requires_tools),
-        float(evidence.high_risk),
+        float(task_ast.high_risk),
     ]
-    language = evidence.language
+    language = task_ast.language
     values.extend(float(language == label) for label in _LANGUAGES)
-    values.extend(float(evidence.intent_scores.get(label, 0.0)) for label in _INTENTS)
-    values.extend(float(evidence.domain_scores.get(label, 0.0)) for label in _DOMAINS)
+    values.extend(float(task_ast.intent_scores.get(label, 0.0)) for label in _INTENTS)
+    values.extend(float(task_ast.domain_scores.get(label, 0.0)) for label in _DOMAINS)
     values.extend(
-        float(label in evidence.operations)
+        float(label in task_ast.operations)
         for label in _OPERATIONS
     )
     return [max(0.0, min(1.0, float(value))) for value in values]
@@ -135,6 +141,14 @@ def structured_feature_matrix(texts: Iterable[str]) -> list[list[float]]:
     """Vectorize a batch using the same deterministic inference path."""
 
     return [structured_feature_vector(text) for text in texts]
+
+
+def structured_feature_matrix_from_asts(
+    task_asts: Iterable[TaskAST],
+) -> list[list[float]]:
+    """Encode a batch of TaskAST values without running the extractor again."""
+
+    return [structured_feature_vector_from_ast(task_ast) for task_ast in task_asts]
 
 
 def _bounded_log(value: int, scale: float) -> float:

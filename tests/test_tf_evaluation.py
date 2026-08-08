@@ -29,16 +29,16 @@ def _prediction(
 
 class _FakeTensorFlowModel:
     def __init__(self) -> None:
-        self.fused_calls = 0
+        self.inference_calls = 0
         self.raw_calls = 0
 
     def predict_many(self, prompts: list[str]) -> list[dict[str, object]]:
-        self.fused_calls += 1
+        self.inference_calls += 1
         return [
             _prediction(
-                workload="code" if "写" in prompt else "text",
-                intent="create" if "写" in prompt else "explain",
-                complexity="medium" if "写" in prompt else "low",
+                workload="text",
+                intent="explain",
+                complexity="low",
             )
             for prompt in prompts
         ]
@@ -93,22 +93,26 @@ class TensorFlowEvaluationTest(unittest.TestCase):
             ),
         ]
 
-    def test_raw_and_fused_modes_are_separate(self) -> None:
+    def test_raw_and_inference_modes_share_probabilities(self) -> None:
         model = _FakeTensorFlowModel()
 
         raw = evaluate_tensorflow_model(model, self.records, mode="raw")
-        fused = evaluate_tensorflow_model(model, self.records, mode="fused")
+        inference = evaluate_tensorflow_model(model, self.records, mode="inference")
 
         self.assertEqual(raw["mode"], "raw")
-        self.assertEqual(fused["mode"], "fused")
+        self.assertEqual(inference["mode"], "inference")
         self.assertEqual(model.raw_calls, 1)
-        self.assertEqual(model.fused_calls, 1)
+        self.assertEqual(model.inference_calls, 1)
         self.assertIn("needs_clarification", raw["heads"])
         self.assertEqual(raw["heads"]["workload_type"]["accuracy"], 0.6667)
-        self.assertEqual(fused["heads"]["workload_type"]["accuracy"], 1.0)
+        self.assertEqual(inference["heads"]["workload_type"]["accuracy"], 0.6667)
         self.assertEqual(raw["effort"]["supervised_samples"], 1)
         self.assertEqual(raw["effort"]["bucket_supervised_samples"], 2)
         self.assertEqual(raw["effort"]["observed_samples"], 1)
+
+    def test_legacy_fused_mode_is_an_inference_alias(self) -> None:
+        result = evaluate_tensorflow_model(_FakeTensorFlowModel(), self.records, mode="fused")
+        self.assertEqual(result["mode"], "inference")
 
     def test_unknown_mode_is_rejected(self) -> None:
         with self.assertRaises(ValueError):
