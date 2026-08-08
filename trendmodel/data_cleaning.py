@@ -47,7 +47,12 @@ class CleaningReport:
     rejected_rows: int = 0
     redacted_rows: int = 0
     duplicate_rows: int = 0
+    label_conflict_rows: int = 0
+    label_conflict_groups: int = 0
     reject_reasons: Counter[str] = field(default_factory=Counter)
+    conflict_fields: Counter[str] = field(default_factory=Counter)
+    conflict_examples: list[dict[str, Any]] = field(default_factory=list)
+    _conflict_hashes: set[str] = field(default_factory=set, repr=False)
     by_source: dict[str, Counter[str]] = field(default_factory=lambda: defaultdict(Counter))
 
     def reject(self, source: str, reason: str) -> None:
@@ -62,6 +67,33 @@ class CleaningReport:
             self.redacted_rows += 1
             self.by_source[source]["redacted"] += 1
 
+    def note_label_conflict(
+        self,
+        *,
+        source: str,
+        prompt_hash: str,
+        existing_source: str,
+        fields: list[str],
+    ) -> None:
+        """Record a duplicate whose non-null labels disagree with the winner."""
+
+        self.label_conflict_rows += 1
+        if prompt_hash not in self._conflict_hashes:
+            self._conflict_hashes.add(prompt_hash)
+            self.label_conflict_groups += 1
+        for field_name in fields:
+            self.conflict_fields[field_name] += 1
+        self.by_source[source]["label_conflict"] += 1
+        if len(self.conflict_examples) < 20:
+            self.conflict_examples.append(
+                {
+                    "prompt_hash": prompt_hash,
+                    "existing_source": existing_source,
+                    "duplicate_source": source,
+                    "fields": sorted(fields),
+                }
+            )
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "input_rows": self.input_rows,
@@ -69,7 +101,13 @@ class CleaningReport:
             "rejected_rows": self.rejected_rows,
             "redacted_rows": self.redacted_rows,
             "duplicate_rows": self.duplicate_rows,
+            "label_conflict_rows": self.label_conflict_rows,
+            "label_conflict_groups": self.label_conflict_groups,
             "reject_reasons": dict(sorted(self.reject_reasons.items())),
+            "label_conflicts": {
+                "fields": dict(sorted(self.conflict_fields.items())),
+                "examples": list(self.conflict_examples),
+            },
             "by_source": {
                 source: dict(sorted(counters.items()))
                 for source, counters in sorted(self.by_source.items())
@@ -119,7 +157,7 @@ def clean_records(
 
     report = CleaningReport()
     accepted: list[dict[str, Any]] = []
-    seen_hashes: set[str] = set()
+    seen_records: dict[str, dict[str, Any]] = {}
 
     for row in records:
         report.input_rows += 1
@@ -164,15 +202,25 @@ def clean_records(
         was_redacted = redacted_prompt != prompt
         canonical_prompt = re.sub(r"\s+", " ", redacted_prompt).strip()
         prompt_hash = hashlib.sha256(canonical_prompt.encode("utf-8")).hexdigest()
-        if config.deduplicate and prompt_hash in seen_hashes:
-            report.duplicate_rows += 1
-            report.reject(source, "duplicate")
-            continue
-        seen_hashes.add(prompt_hash)
-
         record = dict(row)
         record.pop("text", None)
         _canonicalize_legacy_fields(record)
+        record.setdefault("source", source)
+        if config.deduplicate and prompt_hash in seen_records:
+            existing_record = seen_records[prompt_hash]
+            conflicting_fields = _label_conflict_fields(existing_record, record)
+            if conflicting_fields:
+                report.note_label_conflict(
+                    source=source,
+                    prompt_hash=prompt_hash,
+                    existing_source=_source_name(existing_record),
+                    fields=conflicting_fields,
+                )
+            report.duplicate_rows += 1
+            report.reject(source, "duplicate")
+            continue
+        seen_records[prompt_hash] = record
+
         record["original_prompt"] = redacted_prompt
         record["prompt_hash"] = prompt_hash
         record["cleaned"] = True
@@ -242,6 +290,37 @@ def _canonicalize_legacy_fields(record: dict[str, Any]) -> None:
             for key in ("workload_type", "work_type", "intent", "complexity", "effort_bucket", "effort")
         )
         record["label_source"] = "seed" if has_label else "unlabeled"
+
+
+def _label_conflict_fields(
+    existing: Mapping[str, Any],
+    duplicate: Mapping[str, Any],
+) -> list[str]:
+    """Find fields with two present, normalized but disagreeing labels."""
+
+    fields = (
+        "workload_type",
+        "intent",
+        "complexity",
+        "effort_bucket",
+        "needs_clarification",
+    )
+    conflicts: list[str] = []
+    for field_name in fields:
+        left = _comparable_label(existing.get(field_name))
+        right = _comparable_label(duplicate.get(field_name))
+        if left is not None and right is not None and left != right:
+            conflicts.append(field_name)
+    return conflicts
+
+
+def _comparable_label(value: Any) -> str | None:
+    """Normalize scalar/list/mapping labels for duplicate conflict checks."""
+
+    normalized = _label_value(value)
+    if normalized is None or not str(normalized).strip():
+        return None
+    return str(normalized).strip().casefold()
 
 
 def _label_value(value: Any) -> Any:

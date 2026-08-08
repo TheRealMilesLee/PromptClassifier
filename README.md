@@ -202,7 +202,7 @@ python3 -m trendmodel.train prepare \
   --report data/processed/cleaning_report.json
 ```
 
-`prepare` 会先清洗和去重，再用 `TaskTagger` 产生 workload/intent/complexity 的弱标签。报告会保留 reject reason、来源、teacher 版本和每个字段的 label provenance。它不会生成 `effort_minutes`；如果公共数据没有真实 effort，TensorFlow 的 effort head 会保持未监督。
+`prepare` 会先清洗和去重，再用 `TaskTagger` 产生 workload/intent/complexity 的弱标签。报告会保留 reject reason、来源、teacher 版本、每个字段的 label provenance，以及重复 prompt 中不一致的 canonical label conflict（只记录 prompt hash、来源和冲突字段，不记录原文）。它不会生成 `effort_minutes`；如果公共数据没有真实 effort，TensorFlow 的 effort head 会保持未监督。
 
 真实的 effort 训练数据应来自已完成任务：
 

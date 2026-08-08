@@ -1051,7 +1051,7 @@ effective_weight = label_weight × confidence_weight × gold_replay_multiplier
 flowchart LR
     A["Hugging Face / internal source"] --> B["local raw files"]
     B --> C["source adapter"]
-    C --> D["normalize + redact + deduplicate"]
+    C --> D["normalize + redact + deduplicate + conflict report"]
     D --> E["weak labels / manual labels"]
     E --> F["group-aware train/validation split"]
     F --> G["local TensorFlow training"]
@@ -1558,7 +1558,7 @@ record with observed active_minutes:
 | `trendmodel/train.py` | prepare/train/evaluate CLI 编排，连接本地数据、清洗和 TensorFlow 训练 | 是 |
 | `trendmodel/public_data.py` | Hugging Face source adapter、字段映射、弱标签边界 | 是，只有准备数据时使用 |
 | `trendmodel/local_data.py` | 读取已经下载的本地 Parquet/JSON/JSONL | 是 |
-| `trendmodel/data_cleaning.py` | 规范化、脱敏、去重、拒绝原因和报告 | 是 |
+| `trendmodel/data_cleaning.py` | 规范化、脱敏、去重、拒绝原因、标签冲突检测和报告 | 是 |
 | `trendmodel/embedding.py` | `HashEmbedder` 和可选 SentenceTransformer backend | TaskTagger/准备数据辅助 |
 | `trendmodel/evidence.py` | 规则提取语言、intent/domain/artifact、operation、constraint、risk | 是，训练和推理共用 |
 | `trendmodel/task_ast.py` | 正式 `TaskAST` dataclass、候选分数、风险和 evidence 的统一封装 | 是 |

@@ -67,6 +67,42 @@ class DataCleaningTest(unittest.TestCase):
             self.assertEqual(read_jsonl([path]), rows)
             self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["source"], "test")
 
+    def test_duplicate_label_conflicts_are_reported_without_leaking_prompt_text(self) -> None:
+        records, report = clean_records(
+            [
+                {
+                    "source": "source-a",
+                    "original_prompt": "解释这个 API 设计",
+                    "workload_type": "text",
+                    "intent": "explain",
+                },
+                {
+                    "source": "source-b",
+                    "original_prompt": "解释这个 API 设计",
+                    "workload_type": "code",
+                    "intent": "create",
+                },
+            ]
+        )
+
+        self.assertEqual(len(records), 1)
+        self.assertEqual(report["label_conflict_rows"], 1)
+        self.assertEqual(report["label_conflict_groups"], 1)
+        self.assertEqual(report["label_conflicts"]["fields"], {"intent": 1, "workload_type": 1})
+        self.assertNotIn("解释这个 API 设计", json.dumps(report, ensure_ascii=False))
+        self.assertEqual(len(report["label_conflicts"]["examples"]), 1)
+
+    def test_duplicate_with_missing_label_is_not_a_conflict(self) -> None:
+        _, report = clean_records(
+            [
+                {"source": "a", "original_prompt": "总结这份报告", "intent": "summarize"},
+                {"source": "b", "original_prompt": "总结这份报告"},
+            ]
+        )
+
+        self.assertEqual(report["duplicate_rows"], 1)
+        self.assertEqual(report["label_conflict_rows"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()
