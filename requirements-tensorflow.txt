@@ -1,2 +1,3 @@
-# Linux/Windows CPU or CUDA training/runtime
+# Generic TensorFlow CPU runtime. For NVIDIA CUDA on Linux or WSL2 use
+# requirements-tensorflow-cuda.txt instead.
 tensorflow==2.16.2

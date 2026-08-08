@@ -6,7 +6,7 @@ import json
 import math
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from .tf_data import EFFORT_BUCKET_ORDER, bucket_from_minutes, normalize_model_text
 from .tf_model import require_tensorflow
@@ -200,6 +200,43 @@ class TensorFlowTaskModel:
 
         return [self.predict(prompt) for prompt in prompts]
 
+    def predict_raw_many(
+        self,
+        prompts: list[str],
+        *,
+        batch_size: int = 128,
+    ) -> list[dict[str, Any]]:
+        """Predict with only the neural heads, without structural fusion.
+
+        This is intentionally separate from :meth:`predict`, whose output is
+        the downstream router contract and includes TaskTagger evidence.  It
+        exists for honest evaluation of the saved TensorFlow artifact.
+        """
+
+        if any(not str(prompt).strip() for prompt in prompts):
+            raise ValueError("prompts must not contain empty text")
+        if not prompts:
+            return []
+
+        tf = require_tensorflow()
+        normalized = [normalize_model_text(str(prompt)) for prompt in prompts]
+        raw = self.model.predict(
+            tf.constant(normalized),
+            batch_size=batch_size,
+            verbose=0,
+        )
+        return [
+            _raw_prediction_payload(
+                str(prompt),
+                _raw_batch_row(raw, index),
+                self.workload_labels,
+                self.intent_labels,
+                self.complexity_labels,
+                self.metadata,
+            )
+            for index, prompt in enumerate(prompts)
+        ]
+
 
 def _probabilities(raw: Any, name: str) -> list[float]:
     value = raw[name] if isinstance(raw, dict) else raw
@@ -208,6 +245,130 @@ def _probabilities(raw: Any, name: str) -> list[float]:
     while isinstance(value, list) and len(value) == 1:
         value = value[0]
     return [float(item) for item in value]
+
+
+def _raw_batch_row(raw: Any, index: int) -> dict[str, Any]:
+    """Extract one sample from a batched Keras output mapping."""
+
+    row: dict[str, Any] = {}
+    names = (
+        "workload_type",
+        "intent",
+        "complexity",
+        "effort_log_minutes",
+        "needs_clarification",
+    )
+    for name in names:
+        value = raw[name] if isinstance(raw, dict) else raw
+        if hasattr(value, "numpy"):
+            value = value.numpy()
+        if hasattr(value, "tolist"):
+            value = value.tolist()
+        row[name] = value[index]
+    return row
+
+
+def _raw_prediction_payload(
+    prompt: str,
+    raw: Mapping[str, Any],
+    workload_labels: list[str],
+    intent_labels: list[str],
+    complexity_labels: list[str],
+    metadata: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Build the evaluation contract from neural outputs only."""
+
+    workload_probabilities = _probabilities(raw, "workload_type")
+    intent_probabilities = _probabilities(raw, "intent")
+    complexity_probabilities = _probabilities(raw, "complexity")
+    workload_type = workload_labels[_argmax(workload_probabilities)]
+    intent = intent_labels[_argmax(intent_probabilities)]
+    complexity = complexity_labels[_argmax(complexity_probabilities)]
+    clarification_probability = float(_first_value(raw, "needs_clarification"))
+
+    effort_available = _effort_head_is_supervised(metadata)
+    if effort_available:
+        effort_log_minutes = float(_first_value(raw, "effort_log_minutes"))
+        estimated_minutes = max(1, min(round(math.expm1(effort_log_minutes)), 10_080))
+        effort_bucket = bucket_from_minutes(estimated_minutes)
+        if effort_bucket not in EFFORT_BUCKET_ORDER:
+            effort_bucket = "M"
+        effort_range = _effort_range(effort_bucket)
+        estimated_minutes = max(effort_range[0], min(estimated_minutes, effort_range[1]))
+        effort_confidence = min(
+            0.35,
+            max(0.15, 0.20 + 0.10 * max(complexity_probabilities)),
+        )
+        effort_payload = {
+            "label": effort_bucket,
+            "estimated_minutes": estimated_minutes,
+            "range_minutes": effort_range,
+            "confidence": round(effort_confidence, 4),
+            "basis": (
+                "trained_observed_effort_head"
+                if _has_observed_effort_supervision(metadata)
+                else "bucket_seed_only"
+            ),
+        }
+    else:
+        effort_payload = {
+            "label": "unknown",
+            "estimated_minutes": None,
+            "range_minutes": None,
+            "confidence": 0.0,
+            "basis": "no_effort_supervision",
+        }
+
+    return {
+        "original_prompt": prompt,
+        "workload_type": workload_type,
+        "intent": intent,
+        "complexity": complexity,
+        "predictions": {
+            "workload_type": _classification_payload(
+                workload_type,
+                workload_probabilities,
+                workload_labels,
+            ),
+            "intent": _classification_payload(
+                intent,
+                intent_probabilities,
+                intent_labels,
+            ),
+            "complexity": _classification_payload(
+                complexity,
+                complexity_probabilities,
+                complexity_labels,
+            ),
+            "effort": effort_payload,
+        },
+        "effort": {
+            "bucket": effort_payload["label"],
+            "estimated_minutes": effort_payload["estimated_minutes"],
+            "range_minutes": effort_payload["range_minutes"],
+            "confidence": effort_payload["confidence"],
+            "basis": effort_payload["basis"],
+        },
+        "needs_clarification": clarification_probability >= 0.5,
+        "confidence": {
+            "workload_type": round(max(workload_probabilities), 4),
+            "intent": round(max(intent_probabilities), 4),
+            "complexity": round(max(complexity_probabilities), 4),
+            "effort": effort_payload["confidence"],
+            "overall": round(
+                0.30 * max(workload_probabilities)
+                + 0.30 * max(intent_probabilities)
+                + 0.25 * max(complexity_probabilities)
+                + 0.15 * float(effort_payload["confidence"]),
+                4,
+            ),
+        },
+        "fusion": {
+            "semantic_model": metadata.get("model_id", "trendmodel-text-v1"),
+            "structural_teacher": None,
+            "policy": "raw neural probabilities without structural evidence fusion",
+        },
+    }
 
 
 def _first_value(raw: Any, name: str) -> float:

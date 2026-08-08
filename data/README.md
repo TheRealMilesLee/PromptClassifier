@@ -41,6 +41,45 @@
 
 真实 effort 至少应区分 `active_minutes` 和等待时间。没有实际耗时的记录可以使用 XS/S/M/L/XL 的区间中值跑通训练，但 metadata 会记录这类样本不是 observed effort。
 
+## 独立 gold validation 集
+
+`WildChat`、`Arena` 和 `TaskTagger` 产生的标签不能作为最终质量评估的 gold label。
+请把真实 router prompt 脱敏后复制到 `data/gold_validation.jsonl`，模板在
+`data/gold_validation.template.jsonl`。实际 gold 文件已加入 `.gitignore`，不会被提交。
+
+每条样本至少需要人工确认：
+
+```json
+{
+  "id": "gold-000001",
+  "original_prompt": "请把这个模块重构一下并补充单元测试。",
+  "workload_type": "code",
+  "intent": "modify",
+  "complexity": "medium",
+  "effort_minutes": 120,
+  "effort_bucket": "M",
+  "needs_clarification": false,
+  "source": "internal_gold",
+  "label_source": "manual_gold"
+}
+```
+
+`effort_minutes` 必须是实际 active minutes，不要把等待审批、CI、排队或外部团队
+等待时间算进去。没有真实耗时的样本可以保留 `effort_minutes: null`，但它不能用于
+验证 effort head。
+
+建议先收集 300–1,000 条，且覆盖这些容易混淆的任务对：
+
+- `explain` vs `create`
+- `create` vs `modify`
+- `create` vs `review`
+- `explain` vs `execute`
+- Shell 解释 vs Shell 执行
+- 文档总结 vs 文档改写
+
+Gold 集应与训练数据分开保存，评估时使用 validation split 或完整 gold 文件，不能
+把包含训练记录的全量公共语料结果当成泛化指标。
+
 不要把包含姓名、邮箱、客户信息、密钥、token、内部域名或生产敏感信息的原始聊天直接放进训练集。建议先脱敏，并保留一个不可逆的样本 ID 以便后续修正标签。
 
 ## 公共 prompt 语料

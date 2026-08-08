@@ -325,8 +325,8 @@ def make_dataset(
         import tensorflow as tf
     except ImportError as error:  # pragma: no cover - depends on local environment
         raise RuntimeError(
-            "TensorFlow is not installed; install requirements-tensorflow-macos.txt "
-            "or requirements-tensorflow.txt first"
+            "TensorFlow is not installed; install requirements-tensorflow-macos.txt, "
+            "requirements-tensorflow-cuda.txt, or requirements-tensorflow.txt first"
         ) from error
 
     records = list(records)

@@ -1,0 +1,4 @@
+# NVIDIA CUDA runtime for Linux or WSL2, including RTX 40-series GPUs.
+# The extra installs the CUDA/cuDNN runtime packages expected by TensorFlow.
+# A compatible NVIDIA driver must still be installed and visible to the OS.
+tensorflow[and-cuda]==2.16.2

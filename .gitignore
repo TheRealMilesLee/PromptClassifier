@@ -25,6 +25,8 @@ env/
 data/raw/
 data/processed/
 data/public/
+data/gold/
+data/gold_validation.jsonl
 artifacts/
 
 # Local Hugging Face/cache/runtime state.

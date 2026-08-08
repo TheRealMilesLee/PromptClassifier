@@ -15,7 +15,7 @@ TrendModel 是给 Auto Router 使用的轻量级 prompt 标签模型。它只负
 - OpenAI-compatible `/v1/chat/completions` 的启动和请求格式；
 - 完整 JSON 字段、label、probability、confidence 和 effort 语义；
 - 机器可读的 [task-analysis.schema.json](docs/task-analysis.schema.json)；
-- artifact 版本、Metal/CPU 行为和 Router fallback 建议。
+- artifact 版本、Metal/CUDA/CPU 行为和 Router fallback 建议。
 
 训练产物位于本机 `artifacts/trendmodel-text-v1/`，不提交到 Git。下游只需要复制整个 artifact 目录以及兼容的 Python/TensorFlow runtime。
 
@@ -229,7 +229,7 @@ python3 -m trendmodel.tf_train predict \
 
 模型是 `TextVectorization(character) + Embedding + BiGRU + multi-task heads`，同时预测 workload、intent、complexity、effort 和是否需要澄清。缺失字段通过 sample weight mask；公共数据可以训练分类头，但没有 effort supervision 时不会伪造 effort 数字。保存的 artifact 包括 `model.keras` 和 `metadata.json`，推理 JSON 在保留旧 scalar 字段的同时，新增 `predictions` 概率结构，方便 router 使用候选和置信度。
 
-当前仓库的默认解释器是 Python 3.14。它可以运行清洗、TaskTagger 和 Hugging Face `datasets` 4/5 系列，但仓库固定的 Apple Silicon TensorFlow 2.16.2 没有 Python 3.14 wheel。本机真正训练需要单独准备 Python 3.11/3.12 环境，再安装 `requirements-tensorflow-macos.txt`；这不是代码训练失败，而是运行时 wheel 约束。
+当前仓库的默认解释器是 Python 3.14。它可以运行清洗、TaskTagger 和 Hugging Face `datasets` 4/5 系列，但仓库固定的 TensorFlow 2.16.2 没有 Python 3.14 wheel。本机真正训练需要单独准备 Python 3.11/3.12 环境，再按硬件安装对应 runtime；这不是代码训练失败，而是运行时 wheel 约束。
 
 例如使用已安装的 Homebrew Python 3.12：
 
@@ -243,10 +243,81 @@ python3 -m trendmodel.tf_train predict \
   --require-gpu
 ```
 
-`--require-gpu` 会在 TensorFlow 没有看到 Metal GPU 时直接失败，避免训练过程
+`--require-gpu` 会在 TensorFlow 没有看到 Metal/CUDA GPU 时直接失败，避免训练过程
 悄悄退回 CPU。省略这个参数则允许 CPU fallback。训练后的
 `artifacts/trendmodel-text-v1/metadata.json` 会记录 `physical_devices`、
-`gpu_devices` 和 `accelerator`，可用来确认本次训练实际使用的设备。
+`gpu_devices`、`accelerator` 和 CUDA build 信息，可用来确认本次训练实际使用的设备。
+
+### NVIDIA CUDA（RTX 4070）
+
+RTX 4070 可以运行同一套 TensorFlow 模型。推荐使用 Linux 或 WSL2；当前
+TensorFlow 版本不提供 Windows 原生 GPU 训练路径。先确认 NVIDIA 驱动可见：
+
+```bash
+nvidia-smi
+python3.12 -m venv .venv-tf-cuda
+.venv-tf-cuda/bin/python -m pip install --upgrade pip
+.venv-tf-cuda/bin/pip install -r requirements-tensorflow-cuda.txt
+```
+
+检查 TensorFlow 是否识别 CUDA：
+
+```bash
+.venv-tf-cuda/bin/python - <<'PY'
+import tensorflow as tf
+
+print("tensorflow:", tf.__version__)
+print("built_with_cuda:", tf.test.is_built_with_cuda())
+print("devices:", tf.config.list_physical_devices())
+print("gpus:", tf.config.list_physical_devices("GPU"))
+PY
+```
+
+正式训练使用同一个 `trendmodel.train` 入口：
+
+```bash
+.venv-tf-cuda/bin/python -m trendmodel.train train \
+  --data data/processed/training.jsonl \
+  --artifact artifacts/trendmodel-text-v1-cuda \
+  --epochs 10 \
+  --batch-size 16 \
+  --require-gpu
+```
+
+训练 metadata 中的 `runtime.accelerator` 应为 `cuda`。如果没有 GPU，
+`--require-gpu` 会直接失败，不会把 CUDA 训练静默降级成 CPU。
+
+### 评估口径
+
+评估默认只看固定的 validation split，并同时输出 raw neural head 和下游 fused
+结果：
+
+```bash
+.venv-tf/bin/python -m trendmodel.train evaluate \
+  --data data/processed/training.jsonl \
+  --artifact artifacts/trendmodel-text-v1 \
+  --split validation \
+  --mode both
+```
+
+其中：
+
+- `--mode raw`：只评估 TensorFlow 神经网络，不调用 `TaskTagger`；
+- `--mode fused`：评估下游实际看到的结构化证据融合结果；
+- `--split validation`：默认的留出集；
+- `--split all`：只用于数据诊断，包含训练样本，不能当作泛化指标。
+
+独立 gold 集准备好后，使用：
+
+```bash
+.venv-tf/bin/python -m trendmodel.train evaluate \
+  --data data/gold_validation.jsonl \
+  --artifact artifacts/trendmodel-text-v1 \
+  --split all \
+  --mode both
+```
+
+`data/gold_validation.template.jsonl` 和标注要求见 [数据说明](data/README.md)。
 
 项目同时提供本地 HTTP/OpenAI-compatible adapter。它不是远程大模型服务，而是对本地 TensorFlow artifact 的协议包装；启动方式、请求限制和响应解析见 [下游集成手册](docs/INTEGRATION.md)。如果下游与模型位于同一 Python 进程，优先直接调用 `TensorFlowTaskModel`，避免额外的 HTTP 和 JSON 字符串解析。
 

@@ -11,6 +11,7 @@ from typing import Any, Iterable, Mapping
 from .tf_data import build_label_maps, load_task_records, make_dataset, split_records
 from .tf_inference import TensorFlowTaskModel
 from .tf_model import build_text_model, require_tensorflow
+from .tf_runtime import inspect_tensorflow_runtime
 
 
 def train_model(
@@ -24,12 +25,13 @@ def train_model(
     require_gpu: bool = False,
 ) -> dict[str, object]:
     tf = require_tensorflow()
-    physical_devices = [device.name for device in tf.config.list_physical_devices()]
-    gpu_devices = [device.name for device in tf.config.list_physical_devices("GPU")]
+    runtime = inspect_tensorflow_runtime(tf)
+    gpu_devices = runtime["gpu_devices"]
     if require_gpu and not gpu_devices:
         raise RuntimeError(
-            "TensorFlow did not detect a GPU/Metal device; rerun outside a restricted "
-            "environment or omit --require-gpu to use CPU fallback"
+            "TensorFlow did not detect a GPU/Metal/CUDA device; on Linux or WSL2 "
+            "install requirements-tensorflow-cuda.txt and verify nvidia-smi, or "
+            "rerun without --require-gpu to use CPU fallback"
         )
     tf.keras.utils.set_random_seed(seed)
 
@@ -88,16 +90,12 @@ def train_model(
     )
     evaluation = model.evaluate(validation_dataset, return_dict=True, verbose=0)
     model.save(output_dir / "model.keras")
+    warnings = _training_warnings(supervision_counts)
     metadata = {
         "model_id": "trendmodel-text-v1",
         "model_version": "0.1.1",
         "architecture": "TextVectorization(character) + Embedding + BiGRU + multi-task heads + structured evidence fusion",
-        "runtime": {
-            "tensorflow_version": str(tf.__version__),
-            "physical_devices": physical_devices,
-            "gpu_devices": gpu_devices,
-            "accelerator": "metal" if gpu_devices else "cpu",
-        },
+        "runtime": runtime,
         "labels": label_maps.to_dict(),
         "training_samples": len(train_records),
         "validation_samples": len(validation_records),
@@ -106,13 +104,31 @@ def train_model(
         "effort_supervision_samples": supervision_counts["effort"],
         "label_source_counts": dict(Counter(record.label_source for record in records)),
         "source_counts": dict(Counter(record.source for record in records)),
-        "warnings": _training_warnings(supervision_counts),
+        "warnings": warnings,
         "data_path": str(data_path),
         "epochs_requested": epochs,
         "epochs_completed": len(history.history.get("loss", [])),
         "validation_metrics": {key: float(value) for key, value in evaluation.items()},
+        # Write a complete enough metadata file before loading the artifact
+        # again.  TensorFlowTaskModel.load intentionally requires both files.
+        "artifact_validation_metrics": None,
     }
-    (output_dir / "metadata.json").write_text(
+    metadata_path = output_dir / "metadata.json"
+    metadata_path.write_text(
+        json.dumps(metadata, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    saved_model = TensorFlowTaskModel.load(output_dir)
+    artifact_evaluation = evaluate_tensorflow_model(
+        saved_model,
+        validation_records,
+        mode="raw",
+        batch_size=batch_size,
+    )
+    warnings.extend(_roundtrip_warnings(evaluation, artifact_evaluation))
+    metadata["warnings"] = warnings
+    metadata["artifact_validation_metrics"] = artifact_evaluation
+    metadata_path.write_text(
         json.dumps(metadata, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
@@ -122,6 +138,9 @@ def train_model(
 def evaluate_tensorflow_model(
     model: TensorFlowTaskModel,
     records: Iterable[Any],
+    *,
+    mode: str = "fused",
+    batch_size: int = 128,
 ) -> dict[str, Any]:
     """Evaluate classification heads and effort on available labels.
 
@@ -129,27 +148,41 @@ def evaluate_tensorflow_model(
     corpus where public prompts can supervise workload/intent through a
     teacher but cannot supervise effort.  Metrics are intentionally kept in
     this dependency-free module instead of requiring scikit-learn.
+
+    ``raw`` evaluates only the saved neural heads.  ``fused`` evaluates the
+    downstream contract, including the structural TaskTagger.  They must be
+    reported separately because public labels may themselves come from that
+    teacher.
     """
 
+    if mode not in {"raw", "fused"}:
+        raise ValueError("mode must be 'raw' or 'fused'")
     records = list(records)
-    predictions = [model.predict(record.original_prompt) for record in records]
+    prompts = [record.original_prompt for record in records]
+    if mode == "raw":
+        predictions = model.predict_raw_many(prompts, batch_size=batch_size)
+    else:
+        predictions = model.predict_many(prompts)
     metrics: dict[str, Any] = {
+        "mode": mode,
         "samples": len(records),
         "heads": {},
         "effort": {},
         "by_source": {},
         "label_quality": {},
     }
-    for field in ("workload_type", "intent", "complexity"):
+    for field in ("workload_type", "intent", "complexity", "needs_clarification"):
         actual: list[str] = []
         predicted: list[str] = []
+        weights: list[float] = []
         for record, prediction in zip(records, predictions):
             label = getattr(record, field)
             if label is None:
                 continue
             actual.append(str(label))
-            predicted.append(_prediction_label(prediction, field))
-        metrics["heads"][field] = _classification_metrics(actual, predicted)
+            predicted.append(str(_prediction_value(prediction, field)))
+            weights.append(record.supervision_weight(field))
+        metrics["heads"][field] = _classification_metrics(actual, predicted, weights)
 
     effort_actual: list[float] = []
     effort_predicted: list[float] = []
@@ -200,6 +233,29 @@ def _training_warnings(supervision_counts: Mapping[str, int]) -> list[str]:
     return warnings
 
 
+def _roundtrip_warnings(
+    fit_metrics: Mapping[str, Any],
+    artifact_metrics: Mapping[str, Any],
+) -> list[str]:
+    """Warn when saved-model raw metrics drift from in-memory fit metrics."""
+
+    warnings: list[str] = []
+    heads = artifact_metrics.get("heads", {})
+    for field in ("workload_type", "intent", "complexity", "needs_clarification"):
+        fit_key = f"{field}_accuracy"
+        artifact_head = heads.get(field, {})
+        fit_value = fit_metrics.get(fit_key)
+        artifact_value = artifact_head.get("weighted_accuracy")
+        if fit_value is None or artifact_value is None:
+            continue
+        if abs(float(fit_value) - float(artifact_value)) > 0.05:
+            warnings.append(
+                f"saved artifact raw {field} weighted accuracy differs from in-memory fit "
+                f"({float(fit_value):.4f} vs {float(artifact_value):.4f}); inspect the round-trip evaluation"
+            )
+    return warnings
+
+
 def _prediction_label(prediction: Mapping[str, Any], field: str) -> str:
     nested = prediction.get("predictions", {})
     if isinstance(nested, Mapping) and isinstance(nested.get(field), Mapping):
@@ -207,28 +263,47 @@ def _prediction_label(prediction: Mapping[str, Any], field: str) -> str:
     return str(prediction.get(field, "unknown"))
 
 
-def _classification_metrics(actual: list[str], predicted: list[str]) -> dict[str, Any]:
-    return {
+def _prediction_value(prediction: Mapping[str, Any], field: str) -> Any:
+    if field == "needs_clarification":
+        return bool(prediction.get(field, False))
+    return _prediction_label(prediction, field)
+
+
+def _classification_metrics(
+    actual: list[str],
+    predicted: list[str],
+    weights: list[float] | None = None,
+) -> dict[str, Any]:
+    metrics = {
         "samples": len(actual),
         "accuracy": round(_accuracy(actual, predicted), 4),
         "macro_f1": round(_macro_f1(actual, predicted), 4),
         "actual_distribution": dict(Counter(actual)),
         "predicted_distribution": dict(Counter(predicted)),
     }
+    if weights and len(weights) == len(actual) and sum(weights) > 0:
+        metrics["weighted_accuracy"] = round(
+            sum(weight * (left == right) for left, right, weight in zip(actual, predicted, weights))
+            / sum(weights),
+            4,
+        )
+    return metrics
 
 
 def _evaluate_indexes(records: list[Any], predictions: list[Mapping[str, Any]], indexes: list[int]) -> dict[str, Any]:
     result: dict[str, Any] = {"samples": len(indexes), "heads": {}}
-    for field in ("workload_type", "intent", "complexity"):
+    for field in ("workload_type", "intent", "complexity", "needs_clarification"):
         actual: list[str] = []
         predicted: list[str] = []
+        weights: list[float] = []
         for index in indexes:
             label = getattr(records[index], field)
             if label is None:
                 continue
             actual.append(str(label))
-            predicted.append(_prediction_label(predictions[index], field))
-        result["heads"][field] = _classification_metrics(actual, predicted)
+            predicted.append(str(_prediction_value(predictions[index], field)))
+            weights.append(records[index].supervision_weight(field))
+        result["heads"][field] = _classification_metrics(actual, predicted, weights)
     return result
 
 
@@ -268,6 +343,64 @@ def _mean_absolute_error(actual: list[float], predicted: list[float]) -> float |
     return round(sum(abs(left - right) for left, right in zip(actual, predicted)) / len(actual), 4)
 
 
+def evaluate_saved_model(
+    data_path: str | Path,
+    artifact_dir: str | Path,
+    *,
+    split: str = "validation",
+    mode: str = "both",
+    validation_ratio: float = 0.2,
+    seed: int = 42,
+    batch_size: int = 128,
+) -> dict[str, Any]:
+    """Evaluate a saved artifact with an explicit data split and mode."""
+
+    if split not in {"all", "train", "validation"}:
+        raise ValueError("split must be 'all', 'train', or 'validation'")
+    if mode not in {"raw", "fused", "both"}:
+        raise ValueError("mode must be 'raw', 'fused', or 'both'")
+
+    records = load_task_records(data_path)
+    if split == "all":
+        selected_records = records
+    else:
+        train_records, validation_records = split_records(
+            records,
+            validation_ratio=validation_ratio,
+            seed=seed,
+        )
+        selected_records = train_records if split == "train" else validation_records
+
+    model = TensorFlowTaskModel.load(artifact_dir)
+    modes = ("raw", "fused") if mode == "both" else (mode,)
+    evaluations = {
+        current_mode: evaluate_tensorflow_model(
+            model,
+            selected_records,
+            mode=current_mode,
+            batch_size=batch_size,
+        )
+        for current_mode in modes
+    }
+    warnings = [
+        "raw evaluates neural heads without structural evidence fusion",
+        "fused includes TaskTagger structural evidence and is not an independent teacher-free metric",
+    ]
+    if split == "all":
+        warnings.append("all includes training records; use split=validation for a holdout estimate")
+    return {
+        "data_path": str(data_path),
+        "artifact": str(artifact_dir),
+        "split": split,
+        "total_samples": len(records),
+        "evaluated_samples": len(selected_records),
+        "validation_ratio": validation_ratio,
+        "seed": seed,
+        "evaluations": evaluations,
+        "warnings": warnings,
+    }
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="python -m trendmodel.tf_train")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -282,7 +415,7 @@ def build_parser() -> argparse.ArgumentParser:
     train.add_argument(
         "--require-gpu",
         action="store_true",
-        help="fail instead of silently falling back to CPU when no GPU/Metal device is visible",
+        help="fail instead of silently falling back to CPU when no GPU/Metal/CUDA device is visible",
     )
 
     predict = subparsers.add_parser("predict", help="run one local TensorFlow prediction")
@@ -292,6 +425,21 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate = subparsers.add_parser("evaluate", help="evaluate a saved local TensorFlow model")
     evaluate.add_argument("--data", default="data/examples.jsonl")
     evaluate.add_argument("--artifact", default="artifacts/trendmodel-text-v1")
+    evaluate.add_argument(
+        "--split",
+        choices=("validation", "train", "all"),
+        default="validation",
+        help="evaluate the deterministic validation split by default; all includes training records",
+    )
+    evaluate.add_argument(
+        "--mode",
+        choices=("raw", "fused", "both"),
+        default="both",
+        help="raw neural heads, fused downstream contract, or both",
+    )
+    evaluate.add_argument("--validation-ratio", type=float, default=0.2)
+    evaluate.add_argument("--seed", type=int, default=42)
+    evaluate.add_argument("--batch-size", type=int, default=128)
 
     return parser
 
@@ -316,9 +464,21 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(model.predict(" ".join(args.text)), ensure_ascii=False, indent=2))
         return 0
 
-    model = TensorFlowTaskModel.load(args.artifact)
-    records = load_task_records(args.data)
-    print(json.dumps(evaluate_tensorflow_model(model, records), ensure_ascii=False, indent=2))
+    print(
+        json.dumps(
+            evaluate_saved_model(
+                args.data,
+                args.artifact,
+                split=args.split,
+                mode=args.mode,
+                validation_ratio=args.validation_ratio,
+                seed=args.seed,
+                batch_size=args.batch_size,
+            ),
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
     return 0
 
 

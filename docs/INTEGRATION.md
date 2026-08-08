@@ -21,7 +21,8 @@
 
 ### 安装和路径
 
-TensorFlow 当前固定使用 Apple Silicon Python 3.12 runtime。下游项目可以复用已有环境，也可以在自己的环境安装本项目：
+TensorFlow 当前固定使用 Python 3.11/3.12 runtime。Apple Silicon 使用 Metal
+依赖，Linux/WSL2 NVIDIA 机器使用 CUDA 依赖。下游项目可以复用已有环境，也可以在自己的环境安装本项目：
 
 ```bash
 cd /path/to/TrendModel
@@ -29,6 +30,19 @@ cd /path/to/TrendModel
 .venv-tf/bin/python -m pip install -r requirements-tensorflow-macos.txt
 .venv-tf/bin/python -m pip install -e .
 ```
+
+RTX 4070 等 NVIDIA GPU 请在 Linux 或 WSL2 中使用单独的环境：
+
+```bash
+python3.12 -m venv .venv-tf-cuda
+.venv-tf-cuda/bin/python -m pip install --upgrade pip
+.venv-tf-cuda/bin/pip install -r requirements-tensorflow-cuda.txt
+.venv-tf-cuda/bin/python -m pip install -e .
+```
+
+当前 TensorFlow 版本不提供 Windows 原生 GPU 训练路径；Windows 主机请使用 WSL2。
+训练 artifact 的 `metadata.json` 会记录 `runtime.accelerator`，其值通常为
+`metal`、`cuda` 或 `cpu`。
 
 推理只需要 artifact，不需要 Hugging Face 数据、原始 parquet 或训练 JSONL。默认 artifact 目录是：
 
@@ -376,7 +390,7 @@ python -m trendmodel.train prepare \
   --output data/processed/training.jsonl \
   --report data/processed/training_report.json
 
-# M4 Metal 训练；没有 GPU 时直接失败
+# M4 Metal 或 NVIDIA CUDA 训练；没有 GPU 时直接失败
 .venv-tf/bin/python -m trendmodel.train train \
   --data data/processed/training.jsonl \
   --artifact artifacts/trendmodel-text-v1 \
@@ -387,8 +401,32 @@ python -m trendmodel.train prepare \
 # 保存后的本地评估
 .venv-tf/bin/python -m trendmodel.train evaluate \
   --data data/processed/training.jsonl \
-  --artifact artifacts/trendmodel-text-v1
+  --artifact artifacts/trendmodel-text-v1 \
+  --split validation \
+  --mode both
 ```
+
+评估报告会把两种口径分开：
+
+- `raw`：只使用 TensorFlow 神经网络 head，不调用 `TaskTagger`；
+- `fused`：调用下游实际使用的结构化证据融合逻辑。
+
+默认 `--split validation` 使用与训练相同的确定性留出策略。`--split all` 会包含
+训练样本，只适合做数据分布诊断，不能作为泛化指标。独立人工标注集准备好后，
+建议这样评估：
+
+```bash
+.venv-tf/bin/python -m trendmodel.train evaluate \
+  --data data/gold_validation.jsonl \
+  --artifact artifacts/trendmodel-text-v1 \
+  --split all \
+  --mode both
+```
+
+公共数据的 intent 等弱标签可能来自同一个 `TaskTagger` teacher，因此 `fused` 对
+公共数据的高分不能替代独立 gold 评估。训练时还会把 validation raw 指标与保存后
+重新加载 artifact 的 raw 指标做 round-trip 对照；如果差异明显，metadata 的
+`warnings` 会提示不要直接发布该 artifact。
 
 ### artifact 交付
 
@@ -416,7 +454,7 @@ artifacts/trendmodel-text-v1/
 
 确认目录同时包含 `model.keras` 和 `metadata.json`，并使用与训练兼容的 TensorFlow/Keras runtime。不要只复制 `model.keras`。
 
-### TensorFlow 没有看到 Metal
+### TensorFlow 没有看到 Metal 或 CUDA
 
 训练时使用：
 
@@ -436,6 +474,26 @@ PY
 ```
 
 当前 Apple Silicon 组合是 `tensorflow-macos==2.16.2` 和 `tensorflow-metal==1.2.0`。受限执行环境可能没有 Metal 设备访问权限；这种情况下 `--require-gpu` 应失败，而不是把 CPU 训练误认为 Metal 训练。
+
+### TensorFlow 没有看到 CUDA
+
+在 Linux 或 WSL2 中依次检查：
+
+```bash
+nvidia-smi
+.venv-tf-cuda/bin/python - <<'PY'
+import tensorflow as tf
+
+print(tf.__version__)
+print("built_with_cuda:", tf.test.is_built_with_cuda())
+print(tf.config.list_physical_devices())
+print(tf.config.list_physical_devices("GPU"))
+PY
+```
+
+确认使用了 `requirements-tensorflow-cuda.txt`，而不是 Mac 的
+`requirements-tensorflow-macos.txt`。如果 `nvidia-smi` 正常但 TensorFlow 没有
+GPU，优先重建 CUDA 专用虚拟环境并确认 WSL2 已安装 NVIDIA GPU 驱动支持。
 
 ### HTTP 返回 400
 

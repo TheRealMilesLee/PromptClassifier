@@ -13,7 +13,9 @@ def require_tensorflow():
     except ImportError as error:  # pragma: no cover - depends on local environment
         raise RuntimeError(
             "TensorFlow is not installed. On Apple Silicon run "
-            "python3 -m pip install -r requirements-tensorflow-macos.txt"
+            "python3 -m pip install -r requirements-tensorflow-macos.txt; "
+            "on Linux or WSL2 with NVIDIA CUDA run "
+            "python3 -m pip install -r requirements-tensorflow-cuda.txt"
         ) from error
     return tf
 

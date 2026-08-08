@@ -213,12 +213,27 @@ def build_parser() -> argparse.ArgumentParser:
     train.add_argument(
         "--require-gpu",
         action="store_true",
-        help="fail instead of silently falling back to CPU when no GPU/Metal device is visible",
+        help="fail instead of silently falling back to CPU when no GPU/Metal/CUDA device is visible",
     )
 
     evaluate = subparsers.add_parser("evaluate", help="evaluate a saved TensorFlow model")
     evaluate.add_argument("--data", default="data/processed/prompts.cleaned.jsonl")
     evaluate.add_argument("--artifact", default="artifacts/trendmodel-text-v1")
+    evaluate.add_argument(
+        "--split",
+        choices=("validation", "train", "all"),
+        default="validation",
+        help="evaluate the deterministic validation split by default; all includes training records",
+    )
+    evaluate.add_argument(
+        "--mode",
+        choices=("raw", "fused", "both"),
+        default="both",
+        help="raw neural heads, fused downstream contract, or both",
+    )
+    evaluate.add_argument("--validation-ratio", type=float, default=0.2)
+    evaluate.add_argument("--seed", type=int, default=42)
+    evaluate.add_argument("--batch-size", type=int, default=128)
 
     return parser
 
@@ -257,9 +272,7 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(report, ensure_ascii=False, indent=2))
         return 0
 
-    from .tf_train import evaluate_tensorflow_model, train_model
-    from .tf_data import load_task_records
-    from .tf_inference import TensorFlowTaskModel
+    from .tf_train import evaluate_saved_model, train_model
 
     if args.command == "train":
         metadata = train_model(
@@ -274,9 +287,16 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(metadata, ensure_ascii=False, indent=2))
         return 0
 
-    model = TensorFlowTaskModel.load(args.artifact)
-    metrics = evaluate_tensorflow_model(model, load_task_records(args.data))
-    print(json.dumps(metrics, ensure_ascii=False, indent=2))
+    report = evaluate_saved_model(
+        args.data,
+        args.artifact,
+        split=args.split,
+        mode=args.mode,
+        validation_ratio=args.validation_ratio,
+        seed=args.seed,
+        batch_size=args.batch_size,
+    )
+    print(json.dumps(report, ensure_ascii=False, indent=2))
     return 0
 
 
