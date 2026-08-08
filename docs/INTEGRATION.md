@@ -77,7 +77,7 @@ analyses = classifier.predict_many([
 ])
 ```
 
-当前 `predict_many` 是 contract 级批量接口，但内部仍逐条调用模型；如果后续需要高吞吐，应新增真正的 batched TensorFlow inference，而不是在下游自行猜测输出格式。
+当前 `predict_many` 会一次执行 batched TensorFlow inference，并返回与单条 `predict` 相同的 contract；`batch_size` 可按本机内存和延迟目标调整。TaskAST 仍会逐条提取，这是确定性预处理，不会改变模型概率。
 
 ### 下游建议的最小适配器
 

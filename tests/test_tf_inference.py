@@ -36,13 +36,21 @@ class _FakeKerasModel:
 
     def predict(self, inputs, **kwargs):
         self.inputs.append(inputs)
+        if isinstance(inputs, dict):
+            batch = len(inputs["original_prompt"])
+        else:
+            batch = len(inputs)
+
+        def repeated(value):
+            return [value for _ in range(batch)]
+
         return {
-            "workload_type": [[0.8, 0.2]],
-            "intent": [[0.7, 0.3]],
-            "complexity": [[0.6, 0.4]],
-            "effort_bucket": [[0.05, 0.10, 0.70, 0.10, 0.05]],
-            "effort_log_minutes": [[math.log1p(90.0)]],
-            "needs_clarification": [[0.1]],
+            "workload_type": repeated([0.8, 0.2]),
+            "intent": repeated([0.7, 0.3]),
+            "complexity": repeated([0.6, 0.4]),
+            "effort_bucket": repeated([0.05, 0.10, 0.70, 0.10, 0.05]),
+            "effort_log_minutes": repeated([math.log1p(90.0)]),
+            "needs_clarification": repeated([0.1]),
         }
 
 
@@ -109,6 +117,33 @@ class TensorFlowInferenceContractTest(unittest.TestCase):
         self.assertEqual(raw["task_ir"]["contract_version"], "task-ir-v1")
         self.assertFalse(raw["fusion"]["post_hoc_probability_fusion"])
         self.assertTrue(all(value == 0.0 for value in model.inputs[-1]["structured_features"][0]))
+
+    def test_predict_many_uses_one_batched_model_call(self) -> None:
+        model = _FakeKerasModel()
+        metadata = {
+            "model_id": "test-model",
+            "structured_feature_dim": 56,
+            "labels": {
+                "workload_type": ["text", "code"],
+                "intent": ["explain", "create"],
+                "complexity": ["low", "high"],
+                "effort_bucket": ["XS", "S", "M", "L", "XL"],
+            },
+            "effort_bucket_supervision_samples": 10,
+            "observed_effort_samples": 0,
+        }
+
+        with patch("trendmodel.tf_inference.require_tensorflow", return_value=_FakeTensorFlow):
+            classifier = TensorFlowTaskModel(model, metadata)
+            results = classifier.predict_many(["解释 ./output.py", "请总结这份报告"], batch_size=2)
+
+        self.assertEqual(len(results), 2)
+        self.assertEqual(len(model.inputs), 1)
+        self.assertEqual(len(model.inputs[0]["original_prompt"]), 2)
+        self.assertEqual(
+            results[0]["fusion"]["policy"],
+            "TensorFlow consumes TaskAST features internally; inference returns evidence without post-hoc probability fusion",
+        )
 
     def test_evidence_only_baseline_is_explicitly_rule_based(self) -> None:
         result = evidence_only_prediction(

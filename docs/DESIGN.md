@@ -1316,7 +1316,7 @@ artifacts/trendmodel-text-v1/
 当前版本仍有几个明确限制：
 
 1. TensorFlow 主模型目前没有独立的 domain head；domain 主要来自 TaskAST evidence 和后续的统一 IR 映射。
-2. `predict_many` 当前是逐条推理，高吞吐场景还需要真正的 batched inference。
+2. `predict_many` 已使用一次 Keras batched inference，但每条 prompt 仍需独立提取 TaskAST；更高吞吐场景还可以继续优化 extractor 和 input pipeline。
 3. 新训练 artifact 的 workload、intent、complexity 和 effort distribution 会基于 validation split 做 temperature scaling；如果 validation 标签质量不足，校准结果仍不能替代独立 gold calibration。旧 artifact 的 probability、entropy 和 margin 仍未校准。
 4. 没有真实 active minutes 时，effort 只能作为 bucket 先验，不能当作工时承诺。
 5. 公共数据的弱标签可能继承 teacher 偏差，必须和人工 gold 分开报告。

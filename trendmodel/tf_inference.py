@@ -174,10 +174,44 @@ class TensorFlowTaskModel:
             "model_version": self.metadata.get("model_version", "0.1.0"),
         }
 
-    def predict_many(self, prompts: list[str]) -> list[dict[str, Any]]:
-        """Predict a batch using the same JSON contract as ``predict``."""
+    def predict_many(
+        self,
+        prompts: list[str],
+        *,
+        batch_size: int = 128,
+    ) -> list[dict[str, Any]]:
+        """Predict a batch with one TensorFlow call using the production contract."""
 
-        return [self.predict(prompt) for prompt in prompts]
+        if any(not str(prompt).strip() for prompt in prompts):
+            raise ValueError("prompts must not contain empty text")
+        if not prompts:
+            return []
+        prompt_values = [str(prompt) for prompt in prompts]
+        task_asts = [extract_evidence(prompt) for prompt in prompt_values]
+        raw = self.model.predict(
+            self._model_inputs(
+                prompt_values,
+                task_asts=task_asts,
+                feature_mode="text_ast",
+            ),
+            batch_size=batch_size,
+            verbose=0,
+        )
+        return [
+            _raw_prediction_payload(
+                prompt,
+                _raw_batch_row(raw, index),
+                self.workload_labels,
+                self.intent_labels,
+                self.complexity_labels,
+                self.metadata,
+                effort_bucket_labels=self.effort_bucket_labels,
+                evidence=[item.to_dict() for item in task_asts[index].evidence],
+                task_ast=task_asts[index],
+                production=True,
+            )
+            for index, prompt in enumerate(prompt_values)
+        ]
 
     def predict_raw_many(
         self,
@@ -305,6 +339,7 @@ def _raw_prediction_payload(
     effort_bucket_labels: list[str] | None = None,
     evidence: list[dict[str, Any]] | None = None,
     task_ast: TaskAST | None = None,
+    production: bool = False,
 ) -> dict[str, Any]:
     """Build the evaluation contract from neural outputs only."""
 
@@ -315,12 +350,14 @@ def _raw_prediction_payload(
     intent = intent_labels[_argmax(intent_probabilities)]
     complexity = complexity_labels[_argmax(complexity_probabilities)]
     clarification_probability = float(_first_value(raw, "needs_clarification"))
+    clarification_reasons = _clarification_reasons(prompt, clarification_probability)
 
     effort_payload = _effort_payload_from_raw(
         raw,
         complexity_probabilities,
         metadata,
         effort_bucket_labels=effort_bucket_labels or list(EFFORT_BUCKET_ORDER),
+        needs_clarification=bool(clarification_reasons),
     )
 
     confidence_payload = {
@@ -340,7 +377,11 @@ def _raw_prediction_payload(
         "semantic_model": metadata.get("model_id", "trendmodel-text-v1"),
         "task_ast_schema": metadata.get("task_ast_schema", TaskAST.schema_version),
         "post_hoc_probability_fusion": False,
-        "policy": "TensorFlow consumes TaskAST features internally; raw output exposes neural probabilities without post-hoc fusion",
+        "policy": (
+            "TensorFlow consumes TaskAST features internally; inference returns evidence without post-hoc probability fusion"
+            if production
+            else "TensorFlow consumes TaskAST features internally; raw output exposes neural probabilities without post-hoc fusion"
+        ),
     }
     prediction_payload = {
         "workload_type": _classification_payload(
@@ -360,7 +401,7 @@ def _raw_prediction_payload(
         ),
         "effort": effort_payload,
     }
-    reasons = _clarification_reasons(prompt, clarification_probability)
+    reasons = clarification_reasons
     abstention = abstention_decision(prediction_payload, metadata)
     for reason in abstention.get("reasons", []):
         formatted_reason = f"模型拒识: {reason}"
