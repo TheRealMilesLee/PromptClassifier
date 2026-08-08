@@ -759,10 +759,10 @@ P0 方案 A 已经关闭这条 post-hoc 路径。当前 TensorFlow 对外行为�
 | --- | --- | --- | --- |
 | `TaskEvidence.strength` | 规则 extractor | 某条结构规则匹配得有多强 | 不能 |
 | `TaskAST.intent_scores` 等 | 规则候选分数 | 某个候选标签获得多少结构支持 | 不能 |
-| `predictions.*.probability` | TensorFlow softmax + 受限融合 | 当前 head 对类别的 posterior-like 分量 | 当前不能 |
+| `predictions.*.probability` | TensorFlow softmax/ordinal distribution | 选中 label 的模型分量；新 artifact 可经过 temperature scaling | 只有新 artifact 的 validation calibration 后才可近似解释 |
 | `confidence.overall` | 多个 head 的加权组合 | 供 Router 使用的总体确定性分数 | 不能 |
 
-如果未来要把这些分数变成可解释的置信概率，应在没有参与训练、规则调整和阈值选择的 gold validation 集上做 temperature scaling、isotonic regression 或其他 calibration，并报告 ECE、Brier score 和 reliability diagram（Guo et al., 2017）。
+当前训练流程已经在 validation split 上执行 temperature scaling，并把 NLL 与 ECE 写入 artifact metadata；如果要把它作为生产级概率使用，仍应在没有参与训练、规则调整和阈值选择的独立 gold validation 集上复核，并报告 ECE、Brier score 和 reliability diagram（Guo et al., 2017）。
 
 ## 5. 任务标签体系
 
@@ -1122,7 +1122,9 @@ TensorFlow `predict` 先从原始 prompt 提取 TaskAST，然后把同一份 AST
 
 ### 13.1 Probability
 
-`probability` 是对应 head 的 posterior 分量，通常是 softmax 的最大值或选中 label 的概率。它目前不是经过独立 gold 集校准的概率。
+`probability` 是对应 head 的 posterior 分量，通常是 softmax/ordinal distribution 中选中 label 的概率。旧 artifact 没有独立校准；新训练 artifact 的 distribution 会经过 validation temperature scaling。
+
+旧 artifact 没有 `metadata.calibration` 时，仍然只能把它当作未校准的模型分数。新训练 artifact 在 validation split 上拟合 temperature scaling，并在 metadata 记录每个 head 的 temperature、NLL 和 ECE；这一步不改变 argmax label，只调整 distribution、entropy、margin 和 probability 的可信度。
 
 因此：
 
@@ -1284,7 +1286,7 @@ artifacts/trendmodel-text-v1/
 
 1. TensorFlow 主模型目前没有独立的 domain head；domain 主要来自 TaskAST evidence 和后续的统一 IR 映射。
 2. `predict_many` 当前是逐条推理，高吞吐场景还需要真正的 batched inference。
-3. `probability`、`entropy` 和 `margin` 尚未经过独立 gold calibration；后续可参考现代神经网络 calibration 方法（Guo et al., 2017）。
+3. 新训练 artifact 的 workload、intent、complexity 和 effort distribution 会基于 validation split 做 temperature scaling；如果 validation 标签质量不足，校准结果仍不能替代独立 gold calibration。旧 artifact 的 probability、entropy 和 margin 仍未校准。
 4. 没有真实 active minutes 时，effort 只能作为 bucket 先验，不能当作工时承诺。
 5. 公共数据的弱标签可能继承 teacher 偏差，必须和人工 gold 分开报告。
 6. 当前 unknown/OOD 主要依赖澄清规则和不确定性信号，还不是专门训练的开放集识别 head。
@@ -1311,7 +1313,7 @@ artifacts/trendmodel-text-v1/
 
 ### 阶段三：概率和开放集能力
 
-- 在独立 gold 集上做 temperature scaling 或 isotonic calibration；
+- 在独立 gold 集上复核 validation temperature scaling，必要时比较 isotonic calibration；
 - 计算 ECE、Brier score 和按 confidence 分桶的准确率；
 - 增加 unknown/OOD validation；
 - 为低 confidence 和高风险任务设计保守 fallback policy。

@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 from .ablation import ABLATION_MODES, evidence_only_prediction, normalize_ablation_mode
+from .calibration import fit_head_calibration
 from .tf_data import (
     build_label_maps,
     label_balance_weights,
@@ -169,6 +170,20 @@ def train_model(
         encoding="utf-8",
     )
     saved_model = TensorFlowTaskModel.load(output_dir)
+    validation_predictions = saved_model.predict_raw_many(
+        [record.original_prompt for record in validation_records],
+        batch_size=batch_size,
+    )
+    metadata["calibration"] = _fit_calibration_metadata(
+        validation_predictions,
+        validation_records,
+        label_maps,
+    )
+    metadata_path.write_text(
+        json.dumps(metadata, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    saved_model = TensorFlowTaskModel.load(output_dir)
     artifact_evaluation = evaluate_tensorflow_model(
         saved_model,
         validation_records,
@@ -183,6 +198,51 @@ def train_model(
         encoding="utf-8",
     )
     return metadata
+
+
+def _fit_calibration_metadata(
+    predictions: Iterable[Mapping[str, Any]],
+    records: Iterable[Any],
+    label_maps: Any,
+) -> dict[str, Any]:
+    """Fit post-training temperature metadata from the validation split only."""
+
+    eligible_pairs = [
+        (prediction, record)
+        for prediction, record in zip(predictions, records)
+        if _calibration_record_is_trusted(record)
+    ]
+    predictions = [prediction for prediction, _ in eligible_pairs]
+    records = [record for _, record in eligible_pairs]
+    heads: dict[str, dict[str, float | int]] = {}
+    for head, labels, field in (
+        ("workload_type", label_maps.workload_type, "workload_type"),
+        ("intent", label_maps.intent, "intent"),
+        ("complexity", label_maps.complexity, "complexity"),
+        ("effort", label_maps.effort_bucket, "effort_bucket"),
+    ):
+        heads[head] = fit_head_calibration(
+            predictions,
+            [getattr(record, field, None) for record in records],
+            head=head,
+            labels=labels,
+        )
+    fitted = any(int(payload.get("samples", 0)) > 0 for payload in heads.values())
+    return {
+        "method": "temperature_scaling",
+        "status": "fitted" if fitted else "unavailable",
+        "source": "validation_split",
+        "eligible_label_policy": "manual/gold/seed/observed labels only",
+        "eligible_samples": len(records),
+        "heads": heads,
+    }
+
+
+def _calibration_record_is_trusted(record: Any) -> bool:
+    """Keep weak/teacher labels out of the probability calibration split."""
+
+    source = str(getattr(record, "label_source", "")).casefold()
+    return any(marker in source for marker in ("manual", "gold", "seed", "observed"))
 
 
 def evaluate_tensorflow_model(

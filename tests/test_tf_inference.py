@@ -216,6 +216,33 @@ class TensorFlowInferenceContractTest(unittest.TestCase):
 
         self.assertGreater(payload["entropy"], 0.9)
         self.assertLess(payload["margin"], 0.05)
+        self.assertEqual(set(payload["distribution"]), {"create", "modify"})
+
+    def test_fitted_temperature_changes_distribution_but_not_head_contract(self) -> None:
+        model = _FakeKerasModel()
+        metadata = {
+            "model_id": "test-model",
+            "structured_feature_dim": 56,
+            "labels": {
+                "workload_type": ["text", "code"],
+                "intent": ["explain", "create"],
+                "complexity": ["low", "high"],
+                "effort_bucket": ["XS", "S", "M", "L", "XL"],
+            },
+            "effort_bucket_supervision_samples": 10,
+            "calibration": {
+                "method": "temperature_scaling",
+                "status": "fitted",
+                "heads": {"workload_type": {"temperature": 2.0}},
+            },
+        }
+
+        with patch("trendmodel.tf_inference.require_tensorflow", return_value=_FakeTensorFlow):
+            result = TensorFlowTaskModel(model, metadata).predict("解释 ./output.py")
+
+        self.assertEqual(result["predictions"]["workload_type"]["label"], "text")
+        self.assertLess(result["predictions"]["workload_type"]["probability"], 0.8)
+        self.assertEqual(set(result["predictions"]["workload_type"]["distribution"]), {"text", "code"})
 
 
 if __name__ == "__main__":

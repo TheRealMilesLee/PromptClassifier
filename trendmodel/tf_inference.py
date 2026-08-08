@@ -14,6 +14,7 @@ from .tf_data import (
     bucket_from_minutes,
     normalize_model_text,
 )
+from .calibration import calibration_temperature, temperature_scale
 from .evidence import extract_evidence
 from .task_ast import TaskAST
 from .task_ir import TaskIR
@@ -63,9 +64,9 @@ class TensorFlowTaskModel:
             verbose=0,
         )
 
-        workload_probabilities = _probabilities(raw, "workload_type")
-        intent_probabilities = _probabilities(raw, "intent")
-        complexity_probabilities = _probabilities(raw, "complexity")
+        workload_probabilities = _head_probabilities(raw, "workload_type", self.metadata)
+        intent_probabilities = _head_probabilities(raw, "intent", self.metadata)
+        complexity_probabilities = _head_probabilities(raw, "complexity", self.metadata)
         structural_evidence = [item.to_dict() for item in task_ast.evidence]
         workload_type = self.workload_labels[_argmax(workload_probabilities)]
         intent = self.intent_labels[_argmax(intent_probabilities)]
@@ -299,9 +300,9 @@ def _raw_prediction_payload(
 ) -> dict[str, Any]:
     """Build the evaluation contract from neural outputs only."""
 
-    workload_probabilities = _probabilities(raw, "workload_type")
-    intent_probabilities = _probabilities(raw, "intent")
-    complexity_probabilities = _probabilities(raw, "complexity")
+    workload_probabilities = _head_probabilities(raw, "workload_type", metadata)
+    intent_probabilities = _head_probabilities(raw, "intent", metadata)
+    complexity_probabilities = _head_probabilities(raw, "complexity", metadata)
     workload_type = workload_labels[_argmax(workload_probabilities)]
     intent = intent_labels[_argmax(intent_probabilities)]
     complexity = complexity_labels[_argmax(complexity_probabilities)]
@@ -435,15 +436,30 @@ def _classification_payload(
             probabilities[labels.index(label)] if label in labels else 0.0,
             4,
         ),
-        # These are uncertainty diagnostics for the router, not calibrated
-        # probabilities.  Calibration requires an independent gold set.
+        # These are uncertainty diagnostics for the router.  The distribution
+        # is calibrated only when the artifact metadata contains a fitted
+        # temperature from a held-out validation set.
         "entropy": entropy,
         "margin": margin,
+        "distribution": {
+            str(candidate): round(float(probability), 6)
+            for candidate, probability in zip(labels, probabilities)
+        },
         "candidates": [
             {"label": candidate, "probability": round(float(probability), 4)}
             for candidate, probability in ranked
         ],
     }
+
+
+def _head_probabilities(raw: Any, name: str, metadata: Mapping[str, Any]) -> list[float]:
+    """Read one neural head and apply saved temperature calibration if present."""
+
+    probabilities = _probabilities(raw, name)
+    temperature = calibration_temperature(metadata, name)
+    if temperature == 1.0:
+        return probabilities
+    return temperature_scale(probabilities, temperature)
 
 
 def _distribution_uncertainty(probabilities: list[float]) -> tuple[float, float]:
@@ -505,6 +521,10 @@ def _effort_payload_from_raw(
     if has_ordinal_head:
         ordinal_probabilities = _probabilities(raw, "effort_ordinal")
         bucket_probabilities = _ordinal_to_bucket_distribution(ordinal_probabilities)
+        bucket_probabilities = temperature_scale(
+            bucket_probabilities,
+            _effort_temperature(metadata),
+        )
         effort_bucket = effort_bucket_labels[_argmax(bucket_probabilities)]
         bucket_probability = max(bucket_probabilities)
         bucket_candidates = _classification_payload(
@@ -513,7 +533,10 @@ def _effort_payload_from_raw(
             effort_bucket_labels,
         )
     elif has_bucket_head:
-        bucket_probabilities = _probabilities(raw, "effort_bucket")
+        bucket_probabilities = temperature_scale(
+            _probabilities(raw, "effort_bucket"),
+            _effort_temperature(metadata),
+        )
         effort_bucket = effort_bucket_labels[_argmax(bucket_probabilities)]
         bucket_probability = max(bucket_probabilities)
         bucket_candidates = _classification_payload(
@@ -589,6 +612,10 @@ def _effort_payload_from_raw(
         "label": effort_bucket,
         "probability": round(bucket_probability, 4),
         "candidates": bucket_candidates.get("candidates", []),
+        "distribution": {
+            str(candidate): round(float(probability), 6)
+            for candidate, probability in zip(effort_bucket_labels, bucket_probabilities)
+        },
         "entropy": bucket_candidates.get("entropy", 1.0),
         "margin": bucket_candidates.get("margin", 0.0),
         "estimated_minutes": estimated_minutes,
@@ -623,6 +650,15 @@ def _ordinal_to_bucket_distribution(probabilities: list[float]) -> list[float]:
     if total <= 0.0:
         return [1.0 / len(EFFORT_BUCKET_ORDER)] * len(EFFORT_BUCKET_ORDER)
     return [value / total for value in buckets]
+
+
+def _effort_temperature(metadata: Mapping[str, Any]) -> float:
+    """Read the canonical effort calibration key with legacy fallback."""
+
+    temperature = calibration_temperature(metadata, "effort")
+    if temperature != 1.0:
+        return temperature
+    return calibration_temperature(metadata, "effort_bucket")
 
 
 def _effort_head_is_supervised(metadata: dict[str, Any]) -> bool:

@@ -240,7 +240,7 @@ analysis = json.loads(response.choices[0].message.content)
 }
 ```
 
-`probability` 是该 TensorFlow head 输出分布中选中类别的分数，范围为 `[0, 1]`。TaskAST 已经作为结构化输入参与模型计算，但推理阶段不会再把 evidence 作为第二次规则概率修正。该分数适合做候选排序、阈值判断和模型选择权重，不应直接解释成“模型有 81% 的真实正确率”。当前还没有足够的独立 gold 数据进行 calibration。
+`probability` 是该 TensorFlow head 输出分布中选中类别的分数，范围为 `[0, 1]`。TaskAST 已经作为结构化输入参与模型计算，但推理阶段不会再把 evidence 作为第二次规则概率修正。新训练 artifact 会基于 validation split 做 temperature scaling；旧 artifact 或 validation 标签质量不足时，该分数仍不应直接解释成“模型有 81% 的真实正确率”。
 
 `candidates` 只展示 Top 3。完整内部分布的总和为 1，但 Top 3 的分数加起来通常小于 1。
 
@@ -306,6 +306,8 @@ complexity:
 
 ### `confidence`
 
+每个 `predictions.<head>` 现在还会返回完整的 `distribution`。新训练 artifact 会用 validation split 拟合 temperature scaling，`metadata.calibration` 记录方法、样本数、NLL 和 ECE；旧 artifact 没有这个 metadata 时，distribution 仍然只是未校准的模型分数，不能解释为真实正确率。
+
 ```json
 {
   "workload_type": 0.81,
@@ -322,7 +324,7 @@ complexity:
 - `effort` 受监督数据质量影响，当前应明显低权重；
 - `overall` 是多个 head 的加权汇总，不是独立概率事件；
 - 低 confidence 应触发便宜模型 fallback、用户确认或保守路由。
-- `entropy`/`margin` 只能作为排序和拒识信号；在独立 gold 集准备好之前，不要把它们当作经过 calibration 的概率。
+- `entropy`/`margin` 可作为排序和拒识信号；新 artifact 的分布已做 validation calibration，但独立 gold 集仍应作为生产阈值的最终依据。
 
 ### `evidence`
 

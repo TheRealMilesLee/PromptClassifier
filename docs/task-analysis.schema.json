@@ -103,6 +103,10 @@
         "probability": {"$ref": "#/$defs/probability"},
         "entropy": {"$ref": "#/$defs/probability"},
         "margin": {"$ref": "#/$defs/probability"},
+        "distribution": {
+          "type": "object",
+          "additionalProperties": {"$ref": "#/$defs/probability"}
+        },
         "candidates": {
           "type": "array",
           "items": {
