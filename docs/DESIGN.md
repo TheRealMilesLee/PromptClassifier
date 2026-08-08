@@ -16,7 +16,7 @@
 
 ## 相关工作与本文定位
 
-本系统吸收了几个成熟方向的思想：TF-IDF 用于提供高效的词法/字符片段信号 [3]；GRU 和双向循环网络用于建模序列上下文 [1][2]；多任务学习通过共享表示同时优化相关任务 [4]；句向量模型可以把整句映射到适合相似度比较的语义空间 [5]；概率校准则用于把模型分数转化为更可信的置信度 [7]。TrendModel 的区别在于目标不是通用问答或单一 intent 分类，而是把用户请求转换为 Auto Router 可消费的任务能力描述，并且显式保留结构化证据、标签来源和不确定性。
+本系统吸收了几个成熟方向的思想：TF-IDF 用于提供高效的词法/字符片段信号（Salton & Buckley, 1988）；GRU 和双向循环网络用于建模序列上下文（Cho et al., 2014; Schuster & Paliwal, 1997）；多任务学习通过共享表示同时优化相关任务（Caruana, 1997）；句向量模型可以把整句映射到适合相似度比较的语义空间（Reimers & Gurevych, 2019）；概率校准则用于把模型分数转化为更可信的置信度（Guo et al., 2017）。TrendModel 的区别在于目标不是通用问答或单一 intent 分类，而是把用户请求转换为 Auto Router 可消费的任务能力描述，并且显式保留结构化证据、标签来源和不确定性。
 
 本文不是一份声称已经达到某个 benchmark 的实验论文，而是一份和当前代码同步的系统设计论文。所有“当前实现”描述均以仓库中的 TensorFlow、数据管线和推理代码为准；所有“未来”描述都单独标注。
 
@@ -65,6 +65,47 @@ Auto Router = capability matching + cost/quality decision + permission enforceme
 
 因此，TrendModel 把“理解任务”和“选择模型”解耦。TrendModel 提供可解释的 Task IR，下游 Router 只根据 Task IR、候选模型能力、价格、上下文窗口和权限做决策。
 
+### 2.1 问题定义和符号
+
+把一次用户请求记为字符串 `x`。模型不直接生成答案，而是计算一个结构化分析结果 `y`：
+
+```text
+x = original user prompt
+A = TaskAST extracted from x
+φ(A) = fixed-width structured feature vector
+h = neural representation of x and φ(A)
+p = multi-task probability distributions produced by h
+y = Task IR normalized from A, p, and optional context
+```
+
+用更紧凑的形式表示：
+
+```text
+A = E(x)
+p = Fθ(x, φ(A))
+y = N(A, p, z)
+```
+
+其中：
+
+- `E` 是确定性结构化提取器，负责从文本中找出路径、命令、代码块、语言、操作和风险等可观察信号；
+- `φ` 把 TaskAST 编码成当前 TensorFlow 模型使用的 56 维向量；
+- `Fθ` 是参数为 θ 的轻量级多任务模型；
+- `z` 是可选的 Project、附件、工具权限等上下文。当前 TensorFlow 公开 `predict(prompt)` 接口还没有把 `z` 接进来；
+- `N` 是归一化、证据融合、不确定性计算和 JSON 序列化过程。
+
+这个问题本质上是一个多输出预测问题，而不是单一的“分类一个标签”：
+
+```text
+workload_type       ∈ {text, code, analysis, operations, planning, mixed, other}
+intent              ∈ {create, modify, debug, explain, execute, ...}
+complexity          ∈ {low, medium, high}
+effort_bucket       ∈ {XS, S, M, L, XL}
+needs_clarification ∈ {false, true}
+```
+
+这些输出之间有关联，但不完全是父子关系。例如，“C++”可以出现在解释、创建、修改或审阅任务中。因此当前 TensorFlow 模型使用共享表示和多个 heads，而不是强迫所有请求沿一棵单一路径分类。`TaskTagger` 原型路径则会先用 intent 影响 domain、artifact 和 workload 的选择，这是一种更显式的层级推理。
+
 ## 3. 总体设计
 
 当前设计采用四类证据的组合：
@@ -84,7 +125,84 @@ flowchart TD
     J --> K["模型选择、成本策略与权限检查"]
 ```
 
+先记住三句话：
+
+1. **Task AST 是证据层**：它记录 prompt 中观察到的事实和多个候选解释；
+2. **Task IR 是接口层**：它把融合后的任务判断整理成 Router 可以消费的稳定结构；
+3. **Bayesian-style fusion 是更新层**：它把语义模型、结构证据和上下文分数合在一起，并把冲突暴露为不确定性。
+
 ### 3.1 Task AST：把 prompt 转成可计算的任务证据
+
+#### 3.1.1 先理解普通 AST 是什么
+
+AST 是 **Abstract Syntax Tree** 的缩写，中文通常译为“抽象语法树”。它是编译器前端把源代码从一串字符转换成结构化节点的一种表示（Aho et al., 2006; Cooper & Torczon, 2012）。
+
+例如，源代码表达式：
+
+```text
+a + b * c
+```
+
+不能只看成五个平铺的字符或 token。编译器需要知道乘法优先级高于加法，因此可以把它表示为：
+
+```text
+        +
+       / \
+      a   *
+         / \
+        b   c
+```
+
+这棵树表达了两个重要事实：
+
+1. `+` 是根操作，左右子节点分别是 `a` 和 `b * c`；
+2. `*` 是加法右侧的子操作，所以先计算 `b * c`。
+
+AST 和原始文本的区别在于：原始文本强调“字符顺序”，AST 强调“结构和关系”。编译器可以在 AST 上进行类型检查、作用域分析、优化和代码生成，而不必每一步重新从字符串猜测结构。
+
+这里的“树”也不是简单的 JSON 嵌套。它通常包含：
+
+- 节点类型，例如表达式、调用、变量或操作；
+- 节点之间的父子关系；
+- 节点属性，例如名称、位置和字面量；
+- 由解析过程得到的结构约束。
+
+#### 3.1.2 TrendModel 为什么也叫 Task AST
+
+TrendModel 借用了“先把原始输入变成结构化中间层”的思想，但 **Task AST 不是编程语言 AST**。它不会解析完整的中文语法，也不会为每个词建立严格的句法树。更准确地说，TrendModel 的 Task AST 是一个 **router-oriented, AST-like evidence representation**：面向路由的、具有树状组织方式的任务证据表示。
+
+它的根节点代表一次 `TaskRequest`，下面按任务分析所需的维度组织子节点：
+
+```text
+TaskRequest
+├── action candidates: create | modify | debug | explain | execute | ...
+├── domain candidates: programming | networking | operations | document | ...
+├── artifact candidates: source_code | config | command | explanation | ...
+├── operations: dns | kubernetes | database | testing | ...
+├── language: cpp | python | shell | sql | ...
+├── constraints
+│   ├── requires_files
+│   ├── requires_tools
+│   ├── has_code_block
+│   └── has_shell_commands
+├── risk: production | destructive | privileged | ...
+└── evidence signals: kind, label, value, strength, detail
+```
+
+因此，Task AST 这个名字强调的是 **组织方式和处理阶段**，不是宣称我们实现了一个通用中文句法分析器。它回答的问题是：
+
+```text
+在送入轻量分类模型之前，用户请求中有哪些可观察的任务事实和候选解释？
+```
+
+它同时保存两种信息：
+
+1. **可观察事实**：例如文本中确实出现了 `kubectl`、`./deploy/dns.yaml`、代码块或数学符号；
+2. **候选证据**：例如出现 `kubectl` 后，`operations` 候选得到较高支持，但还没有成为最终 workload label。
+
+这一区分很重要。一个 prompt 可以同时包含“解释原因”“修改文件”和“运行命令”三个动作。Task AST 不应该在规则提取阶段假装这些冲突不存在；它应该把它们都保留下来，交给后面的语义模型、融合策略和安全规则处理。
+
+#### 3.1.3 当前实现的正式定义
 
 这里的 Task AST 不是编程语言的语法树，也不是让模型生成一棵完整的自然语言 parse tree。它是一个面向任务路由的、AST-like 的中间结构：根节点代表一次用户请求，子节点代表动作、领域、交付物、操作、约束、风险和证据。它的目的不是直接给出最终标签，而是把“文本中明确观察到的事实”和“由语义模型推断出的候选”分开保存。
 
@@ -106,7 +224,41 @@ TaskRequest
 └── evidence: observable signals with strength and detail
 ```
 
-当前 `TaskAST` dataclass 统一封装 `StructuredEvidence` 过去分散承载的内容：`TaskConstraints`、`TaskEvidence` 序列、`intent_scores`、`domain_scores`、`artifact_scores`、语言、操作和风险原因 [C1][C2][C11]。它仍然不是一个通用 AST parser；`extract_evidence()` 输出的是候选分数和可观测信号，不是最终分类结果。同一个请求可以同时拥有 `debug`、`modify` 和 `execute` 的证据，最终选择仍由语义模型、规则优先级和融合策略共同决定。原来的 `StructuredEvidence` 名称保留为 `TaskAST` 的兼容别名，避免破坏已有调用方。
+当前 `TaskAST` dataclass 统一封装 `StructuredEvidence` 过去分散承载的内容：`TaskConstraints`、`TaskEvidence` 序列、`intent_scores`、`domain_scores`、`artifact_scores`、语言、操作和风险原因。实现见 [`trendmodel/task_ast.py`](../trendmodel/task_ast.py) 和 [`trendmodel/evidence.py`](../trendmodel/evidence.py)。它仍然不是一个通用 AST parser；`extract_evidence()` 输出的是候选分数和可观测信号，不是最终分类结果。同一个请求可以同时拥有 `debug`、`modify` 和 `execute` 的证据，最终选择仍由语义模型、规则优先级和融合策略共同决定。原来的 `StructuredEvidence` 名称保留为 `TaskAST` 的兼容别名，避免破坏已有调用方。
+
+当前代码中的 `TaskAST` 是一个不可变的 Python `dataclass`。它把原来分散在 `StructuredEvidence`、规则返回值和若干局部变量里的信息放进一个明确契约中（实现见 [`trendmodel/task_ast.py`](../trendmodel/task_ast.py) 和 [`trendmodel/evidence.py`](../trendmodel/evidence.py)）。其字段可以按下表理解：
+
+| 字段 | 类型/示例 | 含义 | 是否是最终结论 |
+| --- | --- | --- | --- |
+| `original_prompt` | `str` | 原始请求文本 | 否，是审计输入 |
+| `constraints` | `TaskConstraints` | 文件、工具、代码块、路径、命令、数学符号、URL 等布尔事实 | 否 |
+| `language` | `"python"`、`"cpp"`、`"shell"` | 规则检测到的语言或命令环境 | 否 |
+| `operations` | `("dns", "kubernetes")` | 检测到的技术操作或对象 | 否 |
+| `signals` / `evidence` | `TaskEvidence` 序列 | 每个可观察信号的 kind、label、value、strength 和 detail | 否 |
+| `intent_scores` | `{"debug": 0.97}` | 动作候选的规则证据分数 | 否 |
+| `domain_scores` | `{"operations": 0.80}` | 领域候选的规则证据分数 | 否 |
+| `artifact_scores` | `{"command": 0.90}` | 交付物候选的规则证据分数 | 否 |
+| `high_risk` | `True` / `False` | 是否发现生产、删除、提权、发布等风险信号 | 否，是安全提示 |
+| `risk_reasons` | `("production", "migration_or_release")` | 风险原因列表 | 否 |
+
+这里必须区分三个词：
+
+- **事实（fact）**：文本里确实出现了某个路径、命令或结构；
+- **候选分数（candidate evidence score）**：某条规则对一个候选标签的支持程度；
+- **最终概率（model probability）**：模型经过 softmax 和融合后，对最终类别给出的分布分量。
+
+TaskAST 中的 `strength` 和 `*_scores` 属于前两类，不等于最终 probability。它们表示“某条规则匹配得有多强”，而不是“最终分类正确的概率”。同一个请求可以同时有 `debug`、`modify` 和 `execute` 三种非零候选；TaskAST 的职责是保存这种不确定性和冲突，而不是提前强行选一个。
+
+TaskAST 的几个不变量是：
+
+1. `original_prompt` 必须是非空字符串；
+2. 候选分数必须在 `[0, 1]`；
+3. `operations` 和 `risk_reasons` 不允许出现空标签；
+4. evidence 是可观察信号，不是模型自由生成的解释；
+5. `requires_tools=true` 和 `high_risk=true` 只是路由/安全输入，绝不等于已经获得工具权限；
+6. `schema_version` 当前为 `task-ast-v1`，用于未来演进和回放。
+
+当前保留 `signals` 字段是为了兼容旧调用方；新代码可以使用语义更清楚的 `evidence` 属性。`action_scores` 是 `intent_scores` 的 AST-oriented 别名。两者都指向候选证据，不是最终 intent label。
 
 例如输入：
 
@@ -129,11 +281,287 @@ risk: production, migration_or_release
 
 这些字段是“证据和候选”，不是权限授权。尤其是 `requires_tools=true` 或 `risk=production` 只能提醒下游 Router 进入安全检查，不能触发执行。
 
-### 3.2 Task IR：把证据压缩成 Router 合同
+### 3.2 IR：先理解“中间表示”这个概念
 
-Task IR 是面向下游的稳定表示，解决的是“模型内部如何判断”和“Router 需要消费什么”之间的接口问题。原型 `TaskTagger` 直接构造 `TaskIR` dataclass，字段包括 `intent`、`domains`、`workload_type`、`artifact`、`operations`、`language`、`constraints`、`capability_demand`、`complexity`、`effort`、`risk_level`、`confidence`、`needs_clarification` 和 `evidence` [C2][C3]。
+IR 是 **Intermediate Representation** 的缩写，中文通常译为“中间表示”或“中间代码”。在编译器里，源代码 AST 经过语义分析后，会被转换成一种比源代码更规整、又比最终机器码更抽象的表示。编译器优化、不同硬件后端和代码生成阶段可以共同消费这种表示（Aho et al., 2006; Lattner & Adve, 2004）。
 
-TensorFlow 主模型的 `TensorFlowTaskModel.predict()` 返回的是与 Task IR 语义对应的 JSON contract，但为了兼容现有 Router，当前最外层主要暴露 `workload_type`、`intent`、`complexity`、`predictions`、`effort`、`evidence`、`fusion`、`confidence` 和 `needs_clarification` [C6]。它不是 `TaskIR` dataclass 的逐字段复制；例如 prototype 路径的 `domains`、`artifact` 和 `capability_demand` 目前主要保留在 TaskTagger 路径，TensorFlow JSON 则通过 evidence 和三类主要 heads 提供路由信息。这个区别必须保留，否则下游会误以为两条模型路径的输出概率可以直接比较。
+可以把编译器粗略想象成：
+
+```text
+source code
+    ↓ parse
+AST
+    ↓ type checking / semantic analysis
+IR
+    ↓ optimization / code generation
+machine code
+```
+
+IR 的价值不是“把前一步的对象换一个名字”，而是定义一个稳定的阶段间接口：后续模块不必理解所有源语言细节，只需要理解 IR 的字段和语义。
+
+### 3.3 Task IR：把证据压缩成 Router 合同
+
+在 TrendModel 中，**Task IR 是证据提取、语义分类和不确定性处理之后，供 Auto Router 消费的规范化任务表示**。它不是编译器意义上的机器码，也不是一个具体供应商模型的调用参数。它把“这个 prompt 可能是什么”转换为“Router 可以稳定读取哪些能力需求、风险和置信度”。
+
+可以把 Task IR 写成一个函数：
+
+```text
+TaskIR = Normalize(
+    semantic_predictions,
+    structural_evidence,
+    optional_context_prior,
+    uncertainty_diagnostics,
+    effort_supervision_basis
+)
+```
+
+Task IR 不是以下任何东西：
+
+- 不是原始 prompt 的 JSON 包装；
+- 不是 TaskAST 的逐字段 dump；TaskAST 保留了更多中间证据和冲突；
+- 不是最终模型选择结果；它不说“必须调用 Model-A”；
+- 不是最终生成答案；
+- 不是工具权限或安全审批；`execute` 和 `high_risk` 仍需下游策略确认。
+
+原型 `TaskTagger` 直接构造 `TaskIR` dataclass，字段包括 `intent`、`domains`、`workload_type`、`artifact`、`operations`、`language`、`constraints`、`capability_demand`、`complexity`、`effort`、`risk_level`、`confidence`、`needs_clarification` 和 `evidence`（实现见 [`trendmodel/task_ir.py`](../trendmodel/task_ir.py) 和 [`trendmodel/tagger.py`](../trendmodel/tagger.py)）。
+
+TensorFlow 主模型的 `TensorFlowTaskModel.predict()` 返回的是语义等价的 JSON contract，但为了兼容现有 Router，当前最外层主要暴露 `workload_type`、`intent`、`complexity`、`predictions`、`effort`、`evidence`、`fusion`、`confidence` 和 `needs_clarification`（实现见 [`trendmodel/tf_inference.py`](../trendmodel/tf_inference.py)）。它不是 `TaskIR` dataclass 的逐字段复制；例如 prototype 路径的 `domains`、`artifact` 和 `capability_demand` 目前主要保留在 TaskTagger 路径，TensorFlow JSON 则通过 evidence 和三类主要 heads 提供路由信息。
+
+#### 3.3.1 TaskAST 与 Task IR 的区别
+
+| 维度 | Task AST | Task IR |
+| --- | --- | --- |
+| 类比的处理阶段 | 前端提取/结构化分析 | 语义融合后的阶段间接口 |
+| 主要目的 | 保存可观察事实、规则信号和多个候选 | 提供 Router 可以消费的稳定结论 |
+| 信息形态 | 详细、可能有冲突、保留中间状态 | 规范化、包含选中标签和候选概率 |
+| 是否必须有最终标签 | 不必须；可能只有候选 | 通常有 label，也允许 `unknown` |
+| 分数含义 | 规则匹配强度或候选支持度 | head 输出/融合后的 posterior-like score |
+| 是否保存风险事实 | 是，保存 `high_risk` 和原因 | 是，转换成 Router 可检查的风险字段或 evidence |
+| 是否直接给 Router | 通常不直接给 | 是，Task IR/JSON 是接口 |
+| 当前代码 | `TaskAST`，由 `extract_evidence()` 返回 | `TaskIR` dataclass 或 TensorFlow JSON contract |
+| 能否代替权限系统 | 不能 | 不能 |
+
+最容易混淆的地方是：TaskAST 和 Task IR 都可以出现 `intent`、`domain` 或 `evidence` 这些词，但它们在不同阶段含义不同。举例：
+
+```text
+TaskAST.intent_scores["execute"] = 0.98
+    = 规则发现了强执行语义
+
+TaskIR.intent.probability = 0.61
+    = 语义模型和结构化证据融合后，最终 execute 候选的分数
+```
+
+前者说明“文本里有什么信号”，后者说明“整个系统当前准备把它当成什么”。两者不能直接当作同一个 probability 比较。
+
+#### 3.3.2 当前代码中的数据流
+
+```text
+original prompt
+      │
+      ▼
+extract_evidence(prompt)
+      │
+      ▼
+TaskAST
+  ├── constraints / language / operations / risk
+  ├── evidence signals
+  └── intent/domain/artifact candidate scores
+      │
+      ├──────────────► structured_feature_vector ──► 56-dim TensorFlow input
+      │                                      │
+      │                                      ▼
+      │                               TensorFlow multi-task heads
+      │                                      │
+      │                                      ▼
+      │                               raw predictions
+      │
+      └──────────────► TaskTagger prototype + fusion ──► prototype TaskIR
+
+raw predictions + selected high-confidence evidence
+      │
+      ▼
+head-specific Bayesian-style fusion + uncertainty diagnostics
+      │
+      ▼
+TensorFlow JSON contract / router-facing Task IR
+```
+
+有三个实现边界需要明确：
+
+1. `TaskAST` 现在已经是正式 dataclass，不再是只存在于文档中的概念；
+2. `TaskIR` dataclass 主要由 prototype `TaskTagger` 路径生成；
+3. TensorFlow 主模型输出的是与 Task IR 语义对应的 JSON contract，不是把 `TaskIR` dataclass 原封不动复制一遍。
+
+因此，TaskAST 是“证据层”，Task IR 是“路由接口层”。前者帮助我们知道模型为什么有这样的候选，后者帮助下游稳定地使用结果。
+
+### 3.4 完整例子：从中文 prompt 到 Task IR
+
+下面用一个混合自然语言、代码、文件和生产操作的请求走完整链路：
+
+```text
+请在生产 Kubernetes 集群里排查 DNS 超时，修改 ./deploy/dns.yaml，
+运行 kubectl rollout status 并给出回滚方案。
+```
+
+下面的概率数字是为了展示算法如何运作的教学示例，不是当前 artifact 的 benchmark 输出。
+
+#### 第一步：保留原始输入并做模型规范化
+
+系统保留 `original_prompt` 作为审计和最终输出字段；模型分支只做 Unicode/换行规范化，不改变任务语义：
+
+```text
+x_raw   = 原始两行 prompt
+x_model = 规范化换行后的 prompt
+```
+
+这一步的原因是：训练时需要稳定的输入，回放和下游审计又需要知道用户原话。原始文本和模型输入不应混为一谈。
+
+#### 第二步：提取 TaskAST
+
+```text
+TaskAST.root.type = task_request
+
+action candidates:
+  debug   ← “排查 DNS 超时”
+  modify  ← “修改 ./deploy/dns.yaml”
+  execute ← “运行 kubectl rollout status”
+  plan    ← “给出回滚方案”
+
+domain candidates:
+  operations
+  networking
+  programming (弱候选，因为存在配置文件/命令，不代表写程序)
+
+artifact candidates:
+  command
+  source_code_or_config
+  analysis_report
+  rollback_plan
+
+operations:
+  dns, kubernetes, deployment
+
+language:
+  shell (来自 kubectl 命令)
+
+constraints:
+  requires_files=true
+  requires_tools=true
+  has_file_paths=true
+  has_shell_commands=true
+  has_code_block=false
+
+risk:
+  high_risk=true
+  reasons=(production, migration_or_release)
+```
+
+这一步没有“授权 kubectl”，也没有“决定必须使用某个大模型”。它只报告文本中观察到的事实和候选解释。`requires_tools=true` 的真正含义是：下游应该检查是否允许工具调用；如果没有权限，Router 必须选择解释/规划路径，而不是执行路径。
+
+#### 第三步：编码成 TensorFlow 输入
+
+同一个 TaskAST 被两路使用：
+
+```text
+字符文本分支:
+  x_model → character TextVectorization → Embedding → BiGRU
+
+结构化分支:
+  TaskAST → 56-dimensional feature vector → Dense(32)
+
+词法 shortcut 分支:
+  x_model → character 2–5 gram TF-IDF → Dense(128)
+```
+
+这样做的直觉是：BiGRU 负责“整句话的顺序和上下文”，n-gram 负责“kubectl rollout、dns.yaml 这类稳定片段”，TaskAST 分支负责“文本中是否确实存在文件、命令、生产和 Kubernetes 等结构事实”。
+
+#### 第四步：神经模型输出 raw heads
+
+共享表示经过多任务 heads 后，得到：
+
+```text
+workload_type probabilities:
+  code=0.40, operations=0.35, text=0.25
+
+intent probabilities:
+  debug=0.46, modify=0.31, execute=0.18, plan=0.05
+
+complexity probabilities:
+  low=0.05, medium=0.37, high=0.58
+
+effort_bucket probabilities:
+  XS=0.02, S=0.08, M=0.29, L=0.50, XL=0.11
+```
+
+再次强调，这些是教学用的 raw probability 分布；真实输出由当前 artifact 的权重决定。
+
+#### 第五步：对不同 head 使用不同证据
+
+结构证据不能无差别地覆盖所有 head：
+
+| Head | 主要证据 | 原因 |
+| --- | --- | --- |
+| workload | `operations`、`kubernetes`、`dns`、`shell` | 这些事实能支持 operations/networking 方向 |
+| intent | `排查`、`修改`、`运行` 等动作短语 | 动作短语比“代码/网络”等名词更能区分意图 |
+| complexity | 生产、文件、工具、部署、回滚、多步骤 | 这些信号增加上下文和验证需求 |
+| effort | bucket head、complexity、真实 observed minutes（如有） | effort 需要独立监督，不能由规则硬猜 |
+
+因此，“出现 Python”不应直接等于 `create`；“出现 `kubectl`”也不应直接等于“可以执行”。
+
+#### 第六步：生成 Task IR/JSON
+
+融合和不确定性处理后，Router 看到的结果可以是：
+
+```json
+{
+  "original_prompt": "请在生产 Kubernetes 集群里排查 DNS 超时，修改 ./deploy/dns.yaml，运行 kubectl rollout status 并给出回滚方案。",
+  "workload_type": "operations",
+  "intent": "debug",
+  "complexity": "high",
+  "predictions": {
+    "workload_type": {
+      "label": "operations",
+      "probability": 0.7712,
+      "candidates": [
+        {"label": "operations", "probability": 0.7712},
+        {"label": "code", "probability": 0.1408},
+        {"label": "text", "probability": 0.088}
+      ]
+    },
+    "intent": {
+      "label": "debug",
+      "probability": 0.61,
+      "candidates": [
+        {"label": "debug", "probability": 0.61},
+        {"label": "modify", "probability": 0.20},
+        {"label": "execute", "probability": 0.12}
+      ]
+    },
+    "complexity": {
+      "label": "high",
+      "probability": 0.74,
+      "candidates": [
+        {"label": "high", "probability": 0.74},
+        {"label": "medium", "probability": 0.22},
+        {"label": "low", "probability": 0.04}
+      ]
+    }
+  },
+  "effort": {
+    "bucket": "L",
+    "estimated_minutes": 240,
+    "range_minutes": [120, 480],
+    "basis": "trained_effort_bucket_head"
+  },
+  "needs_clarification": false,
+  "evidence": [
+    {"kind": "operation", "label": "kubernetes", "strength": 0.92},
+    {"kind": "risk", "label": "production", "strength": 0.90}
+  ]
+}
+```
+
+这个结果告诉 Router：任务更像生产运维排障，需要高能力和上下文的候选模型，effort 粗粒度为 `L`，但它没有告诉 Router “选择 Model-X”，也没有获得执行权限。下游仍需要检查工具授权、生产变更审批、成本预算和候选模型能力。
 
 Task IR 的设计原则是：
 
@@ -143,7 +571,7 @@ Task IR 的设计原则是：
 4. effort 带有 `basis`，明确区分真实分钟监督、bucket 监督和无监督 fallback；
 5. Task IR 不包含模型选择结果，Router 仍然负责能力匹配、成本/质量权衡和权限执行。
 
-### 3.3 从输入到输出的算法链路
+### 3.5 从输入到输出的算法链路
 
 下面的伪代码描述完整的推理链路。`TaskAST` 保存结构化 evidence；`BayesianFuse` 是 Bayesian-style 的受限近似，而不是已校准的严格后验。
 
@@ -183,7 +611,7 @@ Output:
 15. return y
 ```
 
-步骤 4 和步骤 9 使用同一套结构化 extractor，减少训练/推理特征漂移；步骤 10 只对指定 head 融合指定证据，不让一个 Python 标记无差别地改变所有分类；步骤 11 单独处理 effort，避免把 bucket midpoint 伪装成真实工作时间。
+步骤 4 和步骤 9 使用同一套结构化 extractor，减少训练/推理特征漂移；步骤 10 只对指定 head 融合指定证据，不让一个 Python 标记无差别地改变所有分类；步骤 11 单独处理 effort，避免把 bucket midpoint 伪装成真实工作时间。需要注意，算法中的 `TaskTagger` teacher 是当前 TensorFlow 推理路径使用的高置信结构证据来源；它不是第二个最终模型，不能把两个模型的 probability 直接平均。
 
 核心思想不是用一个算法解决所有问题，而是给不同类型的信号分配不同的责任：
 
@@ -232,6 +660,17 @@ Output:
 概率/贝叶斯层     负责证据融合和不确定性管理
 ```
 
+### 4.1 先理解 Bayes 在这里解决什么问题
+
+贝叶斯定理回答的是一个很具体的问题：当我们先有一个类别的先验倾向，又观察到文本和结构证据之后，应该如何更新对这个类别的相信程度（Bayes, 1763）？
+
+在分类场景里，可以把几个词先记住：
+
+- **先验（prior）**：还没看当前 prompt 之前，某个类别本来有多常见；
+- **似然（likelihood）**：如果这个类别是真的，当前证据出现的可能性有多大；
+- **后验（posterior）**：看完当前证据后，对这个类别的更新倾向；
+- **证据（evidence）**：当前 prompt、TaskAST 信号和上下文。
+
 贝叶斯形式可以写成：
 
 ```text
@@ -239,9 +678,54 @@ P(class | text, evidence, context)
   ∝ P(text | class) × P(evidence | class) × P(class | context)
 ```
 
-这是对 Bayes 后验思想的工程化表达 [6]。在当前系统中，`P(text | class)` 不由朴素贝叶斯直接估计，而由神经分类 head 或句向量与原型的相似度间接提供；`P(evidence | class)` 来自结构化 extractor；`P(class | context)` 是可选的上下文先验。
+左边是我们想知道的“在所有证据下，属于某个 class 的后验倾向”。右边分成三个来源：
 
-当前实现并没有假设所有概率都已经严格校准，而是采用两种受限的 Bayesian-style 近似。
+1. `P(text | class)`：文本整体语义和这个类别的匹配程度；
+2. `P(evidence | class)`：TaskAST 发现的路径、命令、语言、操作等结构信号对这个类别的支持程度；
+3. `P(class | context)`：Project、附件、当前工具权限等上下文带来的先验倾向。
+
+在当前系统中，`P(text | class)` 不由朴素贝叶斯直接估计，而由神经分类 head 或句向量与原型的相似度间接提供；`P(evidence | class)` 来自结构化 extractor；`P(class | context)` 是可选的上下文先验。
+
+这个公式的工程意义是“把不同来源的证据放在同一套更新逻辑里”，而不是要求系统真的知道每个条件概率的真实统计值。它也解释了为什么贝叶斯层应该放在语义模型之后：如果文本语义本身还没有被编码，规则证据只能告诉我们“出现了什么”，却不能可靠地告诉我们“用户想完成什么”。
+
+### 4.2 一个具体的数值例子
+
+假设 TensorFlow workload head 对一个 prompt 的 raw 分布是：
+
+```text
+p_neural(code)       = 0.40
+p_neural(operations) = 0.35
+p_neural(text)       = 0.25
+```
+
+TaskAST/结构化 teacher 发现了高置信的 Kubernetes、Shell 命令和生产环境信号，因此把结构标签暂时归纳为 `operations`，并估计 `evidence_strength = 0.90`。当前 TensorFlow 推理实现使用一个受限的证据修正：
+
+```text
+α = min(0.72, 0.72 × evidence_strength)
+  = 0.72 × 0.90
+  = 0.648
+
+p_fused = (1 - α) × p_neural + α × one_hot(structural_label)
+```
+
+于是：
+
+```text
+p_fused(operations) = 0.352 × 0.35 + 0.648 × 1.00 = 0.7712
+p_fused(code)       = 0.352 × 0.40 + 0.648 × 0.00 = 0.1408
+p_fused(text)       = 0.352 × 0.25 + 0.648 × 0.00 = 0.0880
+```
+
+这说明了两个设计决策：
+
+- 结构化证据能够把“明显的运维请求”从 `code=0.40` 的模糊 raw 输出拉向 `operations`；
+- 结构证据最多占有限比例，仍然保留神经模型的 35.2% 权重，因此规则不会无条件覆盖语义模型。
+
+这里的 `0.7712` 是融合后的 posterior-like 分数，不是经过独立人工 gold 集校准后的真实正确率。只有当我们收集独立 gold 数据并进行 calibration 后，才可以讨论“预测为 0.8 的样本大约有多少比例正确”。
+
+### 4.3 当前实现：Bayesian-style，而不是严格 Bayes 模型
+
+当前实现并没有假设所有概率都已经严格校准，也没有假设文本、规则和上下文之间相互独立，而是采用两种受限的 Bayesian-style 近似。
 
 在原型 `TaskTagger` 路径中，`fusion.py` 默认使用概率混合：
 
@@ -266,6 +750,17 @@ p_fused = (1 - α) × p_neural + α × one_hot(structural_label)
 2. extractor 也可能误判，不能把规则直接变成绝对硬标签。
 
 高风险操作仍然需要下游权限检查，不能因为融合分数高就自动执行。
+
+需要特别区分下面四种数字：
+
+| 数字 | 来源 | 实际含义 | 能否直接解释为真实正确率 |
+| --- | --- | --- | --- |
+| `TaskEvidence.strength` | 规则 extractor | 某条结构规则匹配得有多强 | 不能 |
+| `TaskAST.intent_scores` 等 | 规则候选分数 | 某个候选标签获得多少结构支持 | 不能 |
+| `predictions.*.probability` | TensorFlow softmax + 受限融合 | 当前 head 对类别的 posterior-like 分量 | 当前不能 |
+| `confidence.overall` | 多个 head 的加权组合 | 供 Router 使用的总体确定性分数 | 不能 |
+
+如果未来要把这些分数变成可解释的置信概率，应在没有参与训练、规则调整和阈值选择的 gold validation 集上做 temperature scaling、isotonic regression 或其他 calibration，并报告 ECE、Brier score 和 reliability diagram（Guo et al., 2017）。
 
 ## 5. 任务标签体系
 
@@ -391,11 +886,11 @@ flowchart LR
 - 对中英文混用更稳健；
 - 模型尺寸和本地推理成本可控。
 
-字符级 BiGRU 用于捕捉顺序和局部上下文。它能够区分“解释某段代码”和“实现某个程序”中动作与对象的组合，而不仅仅统计关键词出现次数。GRU 的门控序列建模来自 [1]，双向循环结构参考 [2]。
+字符级 BiGRU 用于捕捉顺序和局部上下文。它能够区分“解释某段代码”和“实现某个程序”中动作与对象的组合，而不仅仅统计关键词出现次数。GRU 的门控序列建模来自 Cho 等人（2014），双向循环结构参考 Schuster 与 Paliwal（1997）。
 
 ### 6.2 字符 n-gram TF-IDF 分支
 
-字符 n-gram 分支提供一种高效的 lexical shortcut。TF-IDF 的基本思想和 term weighting 传统见 [3]：
+字符 n-gram 分支提供一种高效的 lexical shortcut。TF-IDF 的基本思想和 term weighting 传统见 Salton 与 Buckley（1988）：
 
 - `kubectl rollout`、`api.py`、`C++`、`SELECT ...` 等片段可以形成稳定信号；
 - 对短 prompt 比单纯依赖 recurrent encoder 更友好；
@@ -446,7 +941,7 @@ L_total =
   + 0.7 × L_needs_clarification
 ```
 
-选择多任务学习有几个原因。共享表示、同时学习相关任务的思想见 [4]：
+选择多任务学习有几个原因。共享表示、同时学习相关任务的思想见 Caruana（1997）：
 
 - workload、intent 和 complexity 共享大量语义信息；
 - 结构化信号可以同时帮助多个 head；
@@ -766,7 +1261,7 @@ artifacts/trendmodel-text-v1/
 
 1. TensorFlow 主模型目前没有独立的 domain head；domain 主要来自结构化 teacher 和 evidence。
 2. `predict_many` 当前是逐条推理，高吞吐场景还需要真正的 batched inference。
-3. `probability`、`entropy` 和 `margin` 尚未经过独立 gold calibration；后续可参考现代神经网络 calibration 方法 [7]。
+3. `probability`、`entropy` 和 `margin` 尚未经过独立 gold calibration；后续可参考现代神经网络 calibration 方法（Guo et al., 2017）。
 4. 没有真实 active minutes 时，effort 只能作为 bucket 先验，不能当作工时承诺。
 5. 公共数据的弱标签可能继承 teacher 偏差，必须和人工 gold 分开报告。
 6. 当前 unknown/OOD 主要依赖澄清规则和不确定性信号，还不是专门训练的开放集识别 head。
@@ -826,15 +1321,15 @@ TrendModel 的训练数据不是“越多越好”，而是要覆盖 Router 真�
 
 | 数据源 | 当前状态 | 可提供的监督/证据 | 主要缺口 |
 | --- | --- | --- | --- |
-| WildChat-4.8M [D1] | 已有 adapter；用于 prompt 分布补充 | 多轮自然表达、中文/英文混用、任务形态 | 没有可信 workload/intent/active minutes；只取第一条 user prompt |
-| Arena Human Preference 140K [D2] | 已有 adapter；有限使用 | `is_code`、category、偏好字段提供代码/非代码弱信号 | 偏好 winner 不是任务类型，也不是 effort；`is_code=false` 不能直接当 text gold |
-| xLAM Function Calling 60K [D3] | 已有 adapter；训练辅助/主料候选 | `execute`、工具调用、工具数量和多步调用 proxy | 函数调用存在不等于用户明确授权执行；没有人工工时 |
-| SWE-bench [D4] | 已有 adapter；代码修改主料 | issue、patch、test patch、repository context，支持 `code + modify` | patch 行数不是人工 active minutes；许可证需产品化前单独确认 |
-| SWE-agent trajectories [D5] | 已有 adapter；可选辅助 | 多步 agent 轨迹、工具调用和修改过程 | agent trajectory 是过程数据，不等于真实人类 effort |
-| Code-Feedback [D6] | 已有 adapter；代码表达辅助 | 代码创建类 user prompt，弱映射 `code + create` | label 主要来自数据形态，不是独立人工 Router 标注 |
-| MASSIVE [D7]、MTOP [D8] | 已有 adapter；短指令和 intent 辅助/评估 | 多语言短句、服务查询、`execute/explain` 边界 | 语音助手领域偏差，不能代表开放域 workload |
-| COIG [D9]、OASST1 [D10]、Helpful Instructions [D11] | 已有 adapter；表达覆盖辅助 | 中文、英文和多语言自然表达 | 通用行没有可靠 workload/intent/effort gold |
-| Dolly [D12] | adapter 可用；默认不作为主料 | category 提供粗粒度 intent 辅助 | CC BY-SA 约束和领域/指令偏差，需要单独合规确认 |
+| WildChat-4.8M（Allen Institute for AI, n.d.） | 已有 adapter；用于 prompt 分布补充 | 多轮自然表达、中文/英文混用、任务形态 | 没有可信 workload/intent/active minutes；只取第一条 user prompt |
+| Arena Human Preference 140K（LMSYS Organization, n.d.） | 已有 adapter；有限使用 | `is_code`、category、偏好字段提供代码/非代码弱信号 | 偏好 winner 不是任务类型，也不是 effort；`is_code=false` 不能直接当 text gold |
+| xLAM Function Calling 60K（Salesforce AI Research, n.d.） | 已有 adapter；训练辅助/主料候选 | `execute`、工具调用、工具数量和多步调用 proxy | 函数调用存在不等于用户明确授权执行；没有人工工时 |
+| SWE-bench（Jimenez et al., 2024） | 已有 adapter；代码修改主料 | issue、patch、test patch、repository context，支持 `code + modify` | patch 行数不是人工 active minutes；许可证需产品化前单独确认 |
+| SWE-agent trajectories（Nebius, n.d.） | 已有 adapter；可选辅助 | 多步 agent 轨迹、工具调用和修改过程 | agent trajectory 是过程数据，不等于真实人类 effort |
+| Code-Feedback（M-A-P, n.d.） | 已有 adapter；代码表达辅助 | 代码创建类 user prompt，弱映射 `code + create` | label 主要来自数据形态，不是独立人工 Router 标注 |
+| MASSIVE（Amazon Science, n.d.）、MTOP（Amazon, n.d.） | 已有 adapter；短指令和 intent 辅助/评估 | 多语言短句、服务查询、`execute/explain` 边界 | 语音助手领域偏差，不能代表开放域 workload |
+| COIG（BAAI, n.d.）、OASST1（OpenAssistant, n.d.）、Helpful Instructions（Hugging Face H4, n.d.） | 已有 adapter；表达覆盖辅助 | 中文、英文和多语言自然表达 | 通用行没有可靠 workload/intent/effort gold |
+| Dolly（Databricks, n.d.） | adapter 可用；默认不作为主料 | category 提供粗粒度 intent 辅助 | CC BY-SA 约束和领域/指令偏差，需要单独合规确认 |
 
 当前推荐的第一轮混合数据是 WildChat、Arena、xLAM、SWE-bench、MASSIVE、MTOP、Code-Feedback、COIG 和 Helpful Instructions；SWE-agent trajectories、OASST1 和 Dolly 的 adapter 已保留，但不代表每次训练都应加入。LMSYS-Chat-1M 的兼容读取代码仍在仓库中，但项目决策是“不下载、不清洗、不训练”。
 
@@ -852,7 +1347,7 @@ TrendModel 的训练数据不是“越多越好”，而是要覆盖 Router 真�
 | unknown/OOD 与高风险样本 | Router 不能把模糊请求或生产删除请求误送到自动执行路径 | 模糊 prompt、越权请求、生产变更、破坏性命令和明确拒绝样本 |
 | 路由结果反馈 | 目前模型只学习任务标签，不知道某次低成本路由是否真的达到质量要求 | 选择的模型、成本、延迟、用户纠正、质量回退和最终成功信号 |
 
-因此，下一轮数据工作优先级应是内部 gold、hard negatives、active minutes 和安全/unknown 集，而不是继续堆叠未经标注的聊天数据。`BANKING77` [D13]、`CLINC150` [D14] 和 `GSM8K` [D15] 更适合做独立 intent/OOD/高推理难例评估，不应直接改变通用 workload 分布。
+因此，下一轮数据工作优先级应是内部 gold、hard negatives、active minutes 和安全/unknown 集，而不是继续堆叠未经标注的聊天数据。`BANKING77`（PolyAI, n.d.）、`CLINC150`（DeepPavlov, n.d.）和 `GSM8K`（OpenAI, n.d.）更适合做独立 intent/OOD/高推理难例评估，不应直接改变通用 workload 分布。
 
 ## 20. 标注协议与数据质量控制
 
@@ -974,7 +1469,7 @@ L_total =
   + 0.7 × L_needs_clarification
 ```
 
-其中四个分类 head 使用 sparse categorical cross-entropy，`effort_log_minutes` 使用 Huber loss，`needs_clarification` 使用 binary cross-entropy。缺失的标签对应 sample weight 为 0，因此公共 prompt 可以训练 workload/intent 等字段，而不会因为没有 `active_minutes` 被强行填充成伪真值 [C7][C9]。
+其中四个分类 head 使用 sparse categorical cross-entropy，`effort_log_minutes` 使用 Huber loss，`needs_clarification` 使用 binary cross-entropy。缺失的标签对应 sample weight 为 0，因此公共 prompt 可以训练 workload/intent 等字段，而不会因为没有 `active_minutes` 被强行填充成伪真值（实现见 [`trendmodel/tf_data.py`](../trendmodel/tf_data.py) 和 [`trendmodel/tf_train.py`](../trendmodel/tf_train.py)）。
 
 `effort_bucket` 和 `effort_log_minutes` 是两个不同监督目标：
 
@@ -1023,7 +1518,7 @@ record with observed active_minutes:
 
 ### 22.2 训练与推理时的代码边界
 
-训练阶段，`tf_features.structured_feature_vector()` 调用 `evidence.extract_evidence()` 得到 `TaskAST`，再把其中的规则事实编码进 56 维结构化输入；`tf_model.build_text_model()` 再把文本分支和结构分支融合，训练六个 heads [C5][C6][C11]。推理阶段，`tf_inference.TensorFlowTaskModel` 先取得 raw heads，再调用 `TaskTagger` 获取高置信 evidence，对 workload、intent、complexity 做受限融合，最后构造 JSON [C3][C8]。
+训练阶段，`tf_features.structured_feature_vector()` 调用 `evidence.extract_evidence()` 得到 `TaskAST`，再把其中的规则事实编码进 56 维结构化输入；`tf_model.build_text_model()` 再把文本分支和结构分支融合，训练六个 heads。推理阶段，`tf_inference.TensorFlowTaskModel` 先取得 raw heads，再调用 `TaskTagger` 获取高置信 evidence，对 workload、intent、complexity 做受限融合，最后构造 JSON。实现细节见 [`trendmodel/tf_features.py`](../trendmodel/tf_features.py)、[`trendmodel/tf_model.py`](../trendmodel/tf_model.py)、[`trendmodel/tf_inference.py`](../trendmodel/tf_inference.py) 和 [`trendmodel/tagger.py`](../trendmodel/tagger.py)。
 
 这条边界有三个工程含义：
 
@@ -1033,7 +1528,7 @@ record with observed active_minutes:
 
 ### 22.3 推理输出和 Router 使用方式
 
-对外 JSON 的机器可读约束位于 [task-analysis.schema.json](task-analysis.schema.json) [C8]。推荐 Router 按以下顺序使用：
+对外 JSON 的机器可读约束位于 [`task-analysis.schema.json`](task-analysis.schema.json)。推荐 Router 按以下顺序使用：
 
 ```text
 1. 检查 needs_clarification 和 risk/evidence
@@ -1050,77 +1545,88 @@ TrendModel 不应根据自己的输出直接执行 Shell、修改文件或授予
 
 ### 23.1 算法与评估文献
 
-[1] Cho, K., et al. (2014). *Learning Phrase Representations using RNN Encoder–Decoder for Statistical Machine Translation*. arXiv:1406.1078. <https://arxiv.org/abs/1406.1078>
 
-[2] Schuster, M., & Paliwal, K. K. (1997). *Bidirectional recurrent neural networks*. IEEE Transactions on Signal Processing, 45(11), 2673–2681. <https://doi.org/10.1109/78.650093>
+Aho, A. V., Lam, M. S., Sethi, R., & Ullman, J. D. (2006). *Compilers: Principles, techniques, and tools* (2nd ed.). Pearson.
 
-[3] Salton, G., & Buckley, C. (1988). *Term-weighting approaches in automatic text retrieval*. Information Processing & Management, 24(5), 513–523. <https://doi.org/10.1016/0306-4573(88)90021-0>
+Bayes, T. (1763). An essay towards solving a problem in the doctrine of chances. *Philosophical Transactions of the Royal Society of London, 53*, 370–418. <https://doi.org/10.1098/rstl.1763.0053>
 
-[4] Caruana, R. (1997). *Multitask learning*. Machine Learning, 28, 41–75. <https://doi.org/10.1023/A:1007379606734>
+Caruana, R. (1997). Multitask learning. *Machine Learning, 28*, 41–75. <https://doi.org/10.1023/A:1007379606734>
 
-[5] Reimers, N., & Gurevych, I. (2019). *Sentence-BERT: Sentence Embeddings using Siamese BERT-Networks*. EMNLP-IJCNLP. <https://aclanthology.org/D19-1410/>
+Cho, K., van Merriënboer, B., Gulcehre, C., Bahdanau, D., Bougares, F., Schwenk, H., & Bengio, Y. (2014). Learning phrase representations using RNN encoder–decoder for statistical machine translation. *arXiv preprint arXiv:1406.1078*. <https://arxiv.org/abs/1406.1078>
 
-[6] Bayes, T. (1763). *An Essay towards solving a Problem in the Doctrine of Chances*. Philosophical Transactions of the Royal Society of London, 53, 370–418. <https://doi.org/10.1098/rstl.1763.0053>
+Cooper, K. D., & Torczon, L. (2012). *Engineering a compiler* (2nd ed.). Morgan Kaufmann.
 
-[7] Guo, C., et al. (2017). *On Calibration of Modern Neural Networks*. Proceedings of ICML. <https://proceedings.mlr.press/v70/guo17a.html>
+Guo, C., Pleiss, G., Sun, Y., & Weinberger, K. Q. (2017). On calibration of modern neural networks. *Proceedings of the 34th International Conference on Machine Learning*. <https://proceedings.mlr.press/v70/guo17a.html>
+
+Lattner, C., & Adve, V. S. (2004). LLVM: A compilation framework for lifelong program analysis & transformation. *Proceedings of the International Symposium on Code Generation and Optimization*. <https://doi.org/10.1109/CGO.2004.1281665>
+
+Reimers, N., & Gurevych, I. (2019). Sentence-BERT: Sentence embeddings using Siamese BERT-networks. *Proceedings of the 2019 Conference on Empirical Methods in Natural Language Processing and the 9th International Joint Conference on Natural Language Processing*. <https://aclanthology.org/D19-1410/>
+
+Salton, G., & Buckley, C. (1988). Term-weighting approaches in automatic text retrieval. *Information Processing & Management, 24*(5), 513–523. <https://doi.org/10.1016/0306-4573(88)90021-0>
+
+Schuster, M., & Paliwal, K. K. (1997). Bidirectional recurrent neural networks. *IEEE Transactions on Signal Processing, 45*(11), 2673–2681. <https://doi.org/10.1109/78.650093>
 
 ### 23.2 数据集与数据卡
 
-[D1] AllenAI. *WildChat-4.8M*. <https://huggingface.co/datasets/allenai/WildChat-4.8M>
 
-[D2] LMSYS/Arena. *Arena Human Preference 140K*. <https://huggingface.co/datasets/lmarena-ai/arena-human-preference-140k>
+Allen Institute for AI. (n.d.). *WildChat-4.8M* [Data set]. Hugging Face. Retrieved August 8, 2026, from <https://huggingface.co/datasets/allenai/WildChat-4.8M>
 
-[D3] Salesforce. *xLAM Function Calling 60K*. <https://huggingface.co/datasets/Salesforce/xlam-function-calling-60k>
+Amazon. (n.d.). *MTOP* [Data set]. Hugging Face. Retrieved August 8, 2026, from <https://huggingface.co/datasets/tasksource/mtop>
 
-[D4] Jimenez, C. E., et al. (2024). *SWE-bench: Can Language Models Resolve Real-World GitHub Issues?* ICLR. <https://arxiv.org/abs/2310.06770>
+Amazon Science. (n.d.). *MASSIVE* [Data set]. Hugging Face. Retrieved August 8, 2026, from <https://huggingface.co/datasets/AmazonScience/massive>
 
-[D5] Nebius. *SWE-agent-trajectories*. <https://huggingface.co/datasets/nebius/SWE-agent-trajectories>
+BAAI. (n.d.). *COIG* [Data set]. Hugging Face. Retrieved August 8, 2026, from <https://huggingface.co/datasets/BAAI/COIG>
 
-[D6] M-A-P. *Code-Feedback*. <https://huggingface.co/datasets/m-a-p/Code-Feedback>
+Databricks. (n.d.). *databricks-dolly-15k* [Data set]. Hugging Face. Retrieved August 8, 2026, from <https://huggingface.co/datasets/databricks/databricks-dolly-15k>
 
-[D7] Amazon Science. *MASSIVE*. <https://huggingface.co/datasets/AmazonScience/massive>
+DeepPavlov. (n.d.). *CLINC150* [Data set]. Hugging Face. Retrieved August 8, 2026, from <https://huggingface.co/datasets/DeepPavlov/clinc150>
 
-[D8] Amazon. *MTOP*. <https://huggingface.co/datasets/tasksource/mtop>
+Hugging Face H4. (n.d.). *Helpful instructions* [Data set]. Hugging Face. Retrieved August 8, 2026, from <https://huggingface.co/datasets/HuggingFaceH4/helpful-instructions>
 
-[D9] BAAI. *COIG*. <https://huggingface.co/datasets/BAAI/COIG>
+Jimenez, C. E., Yang, C., Wettig, A., Yao, K., Pei, R., Press, O., & Narasimhan, K. (2024). SWE-bench: Can language models resolve real-world GitHub issues? *Proceedings of the International Conference on Learning Representations*. <https://arxiv.org/abs/2310.06770>
 
-[D10] OpenAssistant. *oasst1*. <https://huggingface.co/datasets/OpenAssistant/oasst1>
+LMSYS Organization. (n.d.). *Arena human preference 140K* [Data set]. Hugging Face. Retrieved August 8, 2026, from <https://huggingface.co/datasets/lmarena-ai/arena-human-preference-140k>
 
-[D11] Hugging Face. *helpful-instructions*. <https://huggingface.co/datasets/HuggingFaceH4/helpful-instructions>
+M-A-P. (n.d.). *Code-Feedback* [Data set]. Hugging Face. Retrieved August 8, 2026, from <https://huggingface.co/datasets/m-a-p/Code-Feedback>
 
-[D12] Databricks. *databricks-dolly-15k*. <https://huggingface.co/datasets/databricks/databricks-dolly-15k>
+Nebius. (n.d.). *SWE-agent trajectories* [Data set]. Hugging Face. Retrieved August 8, 2026, from <https://huggingface.co/datasets/nebius/SWE-agent-trajectories>
 
-[D13] PolyAI. *BANKING77*. <https://huggingface.co/datasets/PolyAI/banking77>
+OpenAI. (n.d.). *GSM8K* [Data set]. Hugging Face. Retrieved August 8, 2026, from <https://huggingface.co/datasets/openai/gsm8k>
 
-[D14] DeepPavlov. *CLINC150*. <https://huggingface.co/datasets/DeepPavlov/clinc150>
+OpenAssistant. (n.d.). *OASST1* [Data set]. Hugging Face. Retrieved August 8, 2026, from <https://huggingface.co/datasets/OpenAssistant/oasst1>
 
-[D15] OpenAI. *GSM8K*. <https://huggingface.co/datasets/openai/gsm8k>
+PolyAI. (n.d.). *BANKING77* [Data set]. Hugging Face. Retrieved August 8, 2026, from <https://huggingface.co/datasets/PolyAI/banking77>
 
-### 23.3 当前仓库实现引用
+Salesforce AI Research. (n.d.). *xLAM function calling 60K* [Data set]. Hugging Face. Retrieved August 8, 2026, from <https://huggingface.co/datasets/Salesforce/xlam-function-calling-60k>
 
-[C1] [`trendmodel/evidence.py`](../trendmodel/evidence.py)：结构化 evidence extractor、语言/动作/领域/操作/风险规则。
+### 23.3 Implementation pointers（实现指针，非学术引用）
 
-[C2] [`trendmodel/task_ir.py`](../trendmodel/task_ir.py)：`TaskEvidence`、`TaskConstraints` 和 prototype 路径 `TaskIR` 数据结构。
+以下链接用于说明本文中的“当前实现”如何落在仓库代码里。它们不是外部学术来源，不使用 APA 文献编号，也不用于证明算法在学术意义上的有效性。
 
-[C3] [`trendmodel/tagger.py`](../trendmodel/tagger.py)：句向量/原型相似度、层级选择、context prior 和 Task IR 组装。
+- [`trendmodel/task_ast.py`](../trendmodel/task_ast.py)：正式 `TaskAST` dataclass、候选访问、序列化和兼容性边界。
+- [`trendmodel/evidence.py`](../trendmodel/evidence.py)：结构化 evidence extractor、语言/动作/领域/操作/风险规则。
+- [`trendmodel/task_ir.py`](../trendmodel/task_ir.py)：`TaskEvidence`、`TaskConstraints` 和 prototype 路径 `TaskIR` 数据结构。
+- [`trendmodel/tagger.py`](../trendmodel/tagger.py)：句向量/原型相似度、层级选择、context prior 和 Task IR 组装。
+- [`trendmodel/fusion.py`](../trendmodel/fusion.py)：加权概率混合、乘法 Bayesian-style 实验、entropy/margin/confidence。
+- [`trendmodel/tf_features.py`](../trendmodel/tf_features.py)：56 维结构化特征向量。
+- [`trendmodel/tf_model.py`](../trendmodel/tf_model.py)：字符向量化、BiGRU、n-gram TF-IDF、结构分支和多任务 heads。
+- [`trendmodel/tf_data.py`](../trendmodel/tf_data.py)：记录解析、label map、group split、类别平衡、replay 和 sample-weight mask。
+- [`trendmodel/tf_inference.py`](../trendmodel/tf_inference.py)：raw/fused 推理、effort basis、uncertainty diagnostics 和 JSON contract。
+- [`trendmodel/tf_train.py`](../trendmodel/tf_train.py)：训练、评估、保存、reload round-trip 和 metadata。
+- [`trendmodel/train.py`](../trendmodel/train.py)、[`trendmodel/public_data.py`](../trendmodel/public_data.py)、[`trendmodel/local_data.py`](../trendmodel/local_data.py)、[`trendmodel/data_cleaning.py`](../trendmodel/data_cleaning.py)：本地数据准备、adapter 和清洗边界。
 
-[C4] [`trendmodel/fusion.py`](../trendmodel/fusion.py)：加权概率混合、乘法 Bayesian-style 实验、entropy/margin/confidence。
+### 23.4 APA 7 引用说明
 
-[C5] [`trendmodel/tf_features.py`](../trendmodel/tf_features.py)：56 维结构化特征向量。
+正文使用 APA 7 的作者—年份形式：
 
-[C6] [`trendmodel/tf_model.py`](../trendmodel/tf_model.py)：字符向量化、BiGRU、n-gram TF-IDF、结构分支和多任务 heads。
+- 单一作者：`（Bayes, 1763）`；
+- 两位作者：`（Salton & Buckley, 1988）`；
+- 三位及以上作者：`（Cho et al., 2014）`；
+- 没有稳定出版年份的数据卡：`（Allen Institute for AI, n.d.）`。
 
-[C7] [`trendmodel/tf_data.py`](../trendmodel/tf_data.py)：记录解析、label map、group split、类别平衡、replay 和 sample-weight mask。
+数据集引用只说明数据来源和版本追溯时间，不代表该数据集提供了 TrendModel 所需的 gold workload、intent 或 effort 标签。公共数据的弱标签、数据卡和论文都不能替代内部人工标注。
 
-[C8] [`trendmodel/tf_inference.py`](../trendmodel/tf_inference.py)：raw/fused 推理、effort basis、uncertainty diagnostics 和 JSON contract。
-
-[C9] [`trendmodel/tf_train.py`](../trendmodel/tf_train.py)：训练、评估、保存、reload round-trip 和 metadata。
-
-[C10] [`trendmodel/train.py`](../trendmodel/train.py)、[`public_data.py`](../trendmodel/public_data.py)、[`local_data.py`](../trendmodel/local_data.py)、[`data_cleaning.py`](../trendmodel/data_cleaning.py)：本地数据准备、adapter 和清洗边界。
-
-[C11] [`trendmodel/task_ast.py`](../trendmodel/task_ast.py)：正式 `TaskAST` dataclass、候选访问、序列化和兼容性边界。
-
-### 23.4 相关文档
+### 23.5 相关文档
 
 - [README](../README.md)：快速运行、训练和 CUDA/Metal 环境；
 - [数据集策略](DATASETS.md)：数据源、许可证、adapter 和本地下载；
