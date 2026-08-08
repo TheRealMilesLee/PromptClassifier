@@ -8,6 +8,7 @@ from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
+from .ablation import ABLATION_MODES, evidence_only_prediction, normalize_ablation_mode
 from .tf_data import (
     build_label_maps,
     label_balance_weights,
@@ -189,6 +190,7 @@ def evaluate_tensorflow_model(
     *,
     mode: str = "inference",
     batch_size: int = 128,
+    feature_mode: str = "text_ast",
 ) -> dict[str, Any]:
     """Evaluate classification heads and effort on available labels.
 
@@ -207,14 +209,97 @@ def evaluate_tensorflow_model(
         mode = "inference"
     if mode not in {"raw", "inference"}:
         raise ValueError("mode must be 'raw' or 'inference'")
+    if feature_mode not in {"text_only", "text_ast"}:
+        raise ValueError("feature_mode must be 'text_only' or 'text_ast'")
     records = list(records)
     prompts = [record.original_prompt for record in records]
     if mode == "raw":
-        predictions = model.predict_raw_many(prompts, batch_size=batch_size)
+        if feature_mode == "text_ast":
+            predictions = model.predict_raw_many(prompts, batch_size=batch_size)
+        else:
+            predictions = model.predict_raw_many(
+                prompts,
+                batch_size=batch_size,
+                feature_mode=feature_mode,
+            )
     else:
+        if feature_mode != "text_ast":
+            raise ValueError("inference mode only supports feature_mode='text_ast'")
         predictions = model.predict_many(prompts)
+    return _metrics_from_predictions(
+        records,
+        predictions,
+        mode=mode,
+        input_ablation=feature_mode,
+    )
+
+
+def evaluate_tensorflow_ablations(
+    model: TensorFlowTaskModel,
+    records: Iterable[Any],
+    *,
+    batch_size: int = 128,
+    selected: str = "all",
+) -> dict[str, dict[str, Any]]:
+    """Compare text-only, text+TaskAST and evidence-only input paths.
+
+    The two neural rows use the same saved artifact and differ only in the
+    structured input.  ``evidence_only`` is a deterministic rule baseline;
+    it is intentionally not a production routing path.
+    """
+
+    records = list(records)
+    if selected not in {"all", *ABLATION_MODES}:
+        raise ValueError(
+            "selected must be 'all', 'text_only', 'text_ast', or 'evidence_only'"
+        )
+    requested = ABLATION_MODES if selected == "all" else (selected,)
+    results: dict[str, dict[str, Any]] = {}
+    if "text_only" in requested:
+        results["text_only"] = evaluate_tensorflow_model(
+            model,
+            records,
+            mode="raw",
+            batch_size=batch_size,
+            feature_mode="text_only",
+        )
+    if "text_ast" in requested:
+        results["text_ast"] = evaluate_tensorflow_model(
+            model,
+            records,
+            mode="raw",
+            batch_size=batch_size,
+            feature_mode="text_ast",
+        )
+    if "evidence_only" in requested:
+        predictions = [
+            evidence_only_prediction(
+                record.original_prompt,
+                workload_labels=model.workload_labels,
+                intent_labels=model.intent_labels,
+                complexity_labels=model.complexity_labels,
+            )
+            for record in records
+        ]
+        results["evidence_only"] = _metrics_from_predictions(
+            records,
+            predictions,
+            mode="evidence_only",
+            input_ablation="evidence_only",
+        )
+    return results
+
+
+def _metrics_from_predictions(
+    records: list[Any],
+    predictions: list[Mapping[str, Any]],
+    *,
+    mode: str,
+    input_ablation: str,
+) -> dict[str, Any]:
     metrics: dict[str, Any] = {
         "mode": mode,
+        "input_ablation": input_ablation,
         "samples": len(records),
         "heads": {},
         "effort": {},
@@ -427,6 +512,7 @@ def evaluate_saved_model(
     *,
     split: str = "validation",
     mode: str = "both",
+    ablation: str = "none",
     validation_ratio: float = 0.2,
     seed: int = 42,
     batch_size: int = 128,
@@ -439,6 +525,7 @@ def evaluate_saved_model(
         mode = "inference"
     if mode not in {"raw", "inference", "both"}:
         raise ValueError("mode must be 'raw', 'inference', or 'both'")
+    ablation = normalize_ablation_mode(ablation)
 
     records = load_task_records(data_path)
     if split == "all":
@@ -468,7 +555,7 @@ def evaluate_saved_model(
     ]
     if split == "all":
         warnings.append("all includes training records; use split=validation for a holdout estimate")
-    return {
+    report = {
         "data_path": str(data_path),
         "artifact": str(artifact_dir),
         "split": split,
@@ -479,6 +566,14 @@ def evaluate_saved_model(
         "evaluations": evaluations,
         "warnings": warnings,
     }
+    if ablation != "none":
+        report["ablations"] = evaluate_tensorflow_ablations(
+            model,
+            selected_records,
+            batch_size=batch_size,
+            selected=ablation,
+        )
+    return report
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -523,6 +618,12 @@ def build_parser() -> argparse.ArgumentParser:
         default="both",
         help="raw neural heads, production inference contract, legacy fused alias, or both",
     )
+    evaluate.add_argument(
+        "--ablation",
+        choices=("none", "all", "text-only", "text+ast", "evidence-only"),
+        default="none",
+        help="optional input ablation report; all compares text-only, text+AST, and evidence-only",
+    )
     evaluate.add_argument("--validation-ratio", type=float, default=0.2)
     evaluate.add_argument("--seed", type=int, default=42)
     evaluate.add_argument("--batch-size", type=int, default=128)
@@ -558,6 +659,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.artifact,
                 split=args.split,
                 mode=args.mode,
+                ablation=args.ablation,
                 validation_ratio=args.validation_ratio,
                 seed=args.seed,
                 batch_size=args.batch_size,

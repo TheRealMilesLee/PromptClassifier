@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 
 from trendmodel.tf_data import TaskRecord
-from trendmodel.tf_train import evaluate_tensorflow_model
+from trendmodel.tf_train import evaluate_tensorflow_ablations, evaluate_tensorflow_model
 
 
 def _prediction(
@@ -31,6 +31,12 @@ class _FakeTensorFlowModel:
     def __init__(self) -> None:
         self.inference_calls = 0
         self.raw_calls = 0
+        self.workload_labels = ["text", "code", "analysis", "operations", "planning", "mixed", "other"]
+        self.intent_labels = [
+            "create", "modify", "debug", "explain", "execute", "analyze", "review",
+            "summarize", "translate", "plan", "extract", "classify", "unknown",
+        ]
+        self.complexity_labels = ["low", "medium", "high"]
 
     def predict_many(self, prompts: list[str]) -> list[dict[str, object]]:
         self.inference_calls += 1
@@ -48,6 +54,7 @@ class _FakeTensorFlowModel:
         prompts: list[str],
         *,
         batch_size: int = 128,
+        feature_mode: str = "text_ast",
     ) -> list[dict[str, object]]:
         self.raw_calls += 1
         return [
@@ -109,6 +116,20 @@ class TensorFlowEvaluationTest(unittest.TestCase):
         self.assertEqual(raw["effort"]["supervised_samples"], 1)
         self.assertEqual(raw["effort"]["bucket_supervised_samples"], 2)
         self.assertEqual(raw["effort"]["observed_samples"], 1)
+
+    def test_ablation_report_contains_three_explicit_paths(self) -> None:
+        model = _FakeTensorFlowModel()
+
+        report = evaluate_tensorflow_ablations(model, self.records)
+
+        self.assertEqual(
+            set(report),
+            {"text_only", "text_ast", "evidence_only"},
+        )
+        self.assertEqual(report["text_only"]["input_ablation"], "text_only")
+        self.assertEqual(report["text_ast"]["input_ablation"], "text_ast")
+        self.assertEqual(report["evidence_only"]["mode"], "evidence_only")
+        self.assertEqual(model.raw_calls, 2)
 
     def test_legacy_fused_mode_is_an_inference_alias(self) -> None:
         result = evaluate_tensorflow_model(_FakeTensorFlowModel(), self.records, mode="fused")

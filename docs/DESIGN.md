@@ -1192,6 +1192,20 @@ Raw evaluation 评估 TensorFlow heads 的输出；这些 heads 本身已经接�
 保存下来的 TensorFlow 模型本身学到了什么？
 ```
 
+### Input ablation
+
+为了避免把“模型学到的语义”和“规则显式提供的结构事实”混成一个数字，评估 CLI
+支持 `--ablation all`。三条路径定义如下：
+
+| 路径 | TensorFlow 文本输入 | TaskAST 输入 | 目的 |
+| --- | --- | --- | --- |
+| `text_only` | 保留 | 置零 | 测量没有结构特征时的文本能力 |
+| `text_ast` | 保留 | 保留 | 当前主模型的真实输入 |
+| `evidence_only` | 不使用 | 只使用 | 测量确定性规则 baseline，不代表生产模型 |
+
+这里的 `text_only` 是同一个已训练 artifact 的输入消融，不是重新训练的纯文本模型，
+因此它适合做贡献诊断，不能替代独立 challenger 的架构比较。
+
 ### Inference evaluation
 
 Inference evaluation 调用生产 `predict` contract。它返回与 raw 相同的 head 概率，并附带同一份 TaskAST evidence，用于回答：
@@ -1259,7 +1273,7 @@ artifacts/trendmodel-text-v1/
 
 当前版本仍有几个明确限制：
 
-1. TensorFlow 主模型目前没有独立的 domain head；domain 主要来自结构化 teacher 和 evidence。
+1. TensorFlow 主模型目前没有独立的 domain head；domain 主要来自 TaskAST evidence 和后续的统一 IR 映射。
 2. `predict_many` 当前是逐条推理，高吞吐场景还需要真正的 batched inference。
 3. `probability`、`entropy` 和 `margin` 尚未经过独立 gold calibration；后续可参考现代神经网络 calibration 方法（Guo et al., 2017）。
 4. 没有真实 active minutes 时，effort 只能作为 bucket 先验，不能当作工时承诺。

@@ -405,7 +405,8 @@ python -m trendmodel.train prepare \
   --data data/processed/training.jsonl \
   --artifact artifacts/trendmodel-text-v1 \
   --split validation \
-  --mode both
+  --mode both \
+  --ablation all
 ```
 
 评估报告会把两种口径分开：
@@ -413,6 +414,15 @@ python -m trendmodel.train prepare \
 - `raw`：TensorFlow heads 的输出；TaskAST 已作为模型输入，不做 post-hoc fusion；
 - `inference`：生产 JSON contract，增加同一份 TaskAST evidence，但概率保持不变；
 - `fused`：旧命令兼容别名，等同于 `inference`，不再表示第二次概率融合。
+
+如需查看输入消融，增加 `--ablation all`。报告会分别给出：
+
+- `text_only`：把已训练 artifact 的结构化特征向量置零，只保留文本分支；
+- `text_ast`：正常使用文本分支和 TaskAST 56 维特征，是当前主路径；
+- `evidence_only`：只用确定性 TaskAST 规则，不经过 TensorFlow，是诊断 baseline。
+
+`text_only` 是输入消融，不是重新训练的纯文本模型；如果要证明删除结构分支后
+架构仍然有效，还需要额外训练一个没有该输入的 challenger artifact。
 
 默认 `--split validation` 使用与训练相同的确定性留出策略。`--split all` 会包含
 训练样本，只适合做数据分布诊断，不能作为泛化指标。独立人工标注集准备好后，

@@ -311,7 +311,8 @@ inference contract；两者都使用训练好的 TensorFlow heads 和内置 Task
   --data data/processed/training.jsonl \
   --artifact artifacts/trendmodel-text-v1 \
   --split validation \
-  --mode both
+  --mode both \
+  --ablation all
 ```
 
 其中：
@@ -319,8 +320,13 @@ inference contract；两者都使用训练好的 TensorFlow heads 和内置 Task
 - `--mode raw`：评估 TensorFlow heads 的结果；TaskAST 已经在模型输入中，不做 post-hoc fusion；
 - `--mode inference`：评估生产 JSON，额外返回 TaskAST evidence，但不修改概率；
 - `--mode fused`：兼容旧命令的别名，实际等同于 `inference`，不再执行旧的概率融合；
+- `--ablation all`：额外输出 `text_only`、`text_ast` 和 `evidence_only` 三条诊断路径；
 - `--split validation`：默认的留出集；
 - `--split all`：只用于数据诊断，包含训练样本，不能当作泛化指标。
+
+消融报告中，`text_only` 是把已训练模型的结构化输入置零，`text_ast` 是当前生产
+输入，`evidence_only` 是不经过神经网络的确定性规则 baseline。它们用于判断语义
+文本、TaskAST 输入和规则证据各自贡献多少，不代表三个可选生产模型。
 
 独立 gold 集准备好后，使用：
 

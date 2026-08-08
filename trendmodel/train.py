@@ -285,6 +285,12 @@ def build_parser() -> argparse.ArgumentParser:
         default="both",
         help="raw neural heads, production inference contract, legacy fused alias, or both",
     )
+    evaluate.add_argument(
+        "--ablation",
+        choices=("none", "all", "text-only", "text+ast", "evidence-only"),
+        default="none",
+        help="optional input ablation report; all compares text-only, text+AST, and evidence-only",
+    )
     evaluate.add_argument("--validation-ratio", type=float, default=0.2)
     evaluate.add_argument("--seed", type=int, default=42)
     evaluate.add_argument("--batch-size", type=int, default=128)
@@ -357,6 +363,7 @@ def main(argv: list[str] | None = None) -> int:
         args.artifact,
         split=args.split,
         mode=args.mode,
+        ablation=args.ablation,
         validation_ratio=args.validation_ratio,
         seed=args.seed,
         batch_size=args.batch_size,

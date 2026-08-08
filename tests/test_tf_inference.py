@@ -4,6 +4,7 @@ import math
 import unittest
 from unittest.mock import patch
 
+from trendmodel.ablation import evidence_only_prediction
 from trendmodel.tf_inference import (
     TensorFlowTaskModel,
     _classification_payload,
@@ -93,6 +94,7 @@ class TensorFlowInferenceContractTest(unittest.TestCase):
             classifier = TensorFlowTaskModel(model, metadata)
             inference = classifier.predict("解释 ./output.py")
             raw = classifier.predict_raw_many(["解释 ./output.py"])[0]
+            classifier.predict_raw_many(["解释 ./output.py"], feature_mode="text_only")
 
         self.assertEqual(
             inference["predictions"]["workload_type"]["probability"],
@@ -100,6 +102,24 @@ class TensorFlowInferenceContractTest(unittest.TestCase):
         )
         self.assertTrue(raw["evidence"])
         self.assertFalse(raw["fusion"]["post_hoc_probability_fusion"])
+        self.assertTrue(all(value == 0.0 for value in model.inputs[-1]["structured_features"][0]))
+
+    def test_evidence_only_baseline_is_explicitly_rule_based(self) -> None:
+        result = evidence_only_prediction(
+            "请执行 kubectl delete pod api-123 -n production",
+            workload_labels=["text", "code", "analysis", "operations", "planning", "mixed", "other"],
+            intent_labels=[
+                "create", "modify", "debug", "explain", "execute", "analyze", "review",
+                "summarize", "translate", "plan", "extract", "classify", "unknown",
+            ],
+            complexity_labels=["low", "medium", "high"],
+        )
+
+        self.assertEqual(result["workload_type"], "operations")
+        self.assertEqual(result["intent"], "execute")
+        self.assertEqual(result["complexity"], "high")
+        self.assertEqual(result["fusion"]["semantic_model"], "none")
+        self.assertEqual(result["effort"]["label"], "unknown")
 
     def test_old_text_only_metadata_keeps_legacy_effort_fallback(self) -> None:
         payload = _effort_payload_from_raw(

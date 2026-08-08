@@ -2,7 +2,12 @@ from __future__ import annotations
 
 import unittest
 
-from trendmodel.tf_features import STRUCTURED_FEATURE_NAMES, structured_feature_vector
+from trendmodel.evidence import extract_evidence
+from trendmodel.tf_features import (
+    STRUCTURED_FEATURE_NAMES,
+    structured_feature_vector,
+    structured_feature_vector_from_ast,
+)
 
 
 class TensorFlowFeatureTest(unittest.TestCase):
@@ -18,6 +23,13 @@ class TensorFlowFeatureTest(unittest.TestCase):
         by_name = dict(zip(STRUCTURED_FEATURE_NAMES, vector))
         self.assertEqual(by_name["has_code_block"], 1.0)
         self.assertEqual(by_name["language:python"], 1.0)
+
+    def test_pre_extracted_task_ast_has_the_same_feature_encoding(self) -> None:
+        prompt = "请执行 kubectl get pods -n production"
+        self.assertEqual(
+            structured_feature_vector(prompt),
+            structured_feature_vector_from_ast(extract_evidence(prompt)),
+        )
 
 
 if __name__ == "__main__":

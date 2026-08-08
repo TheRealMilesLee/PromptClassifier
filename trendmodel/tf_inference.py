@@ -20,6 +20,9 @@ from .tf_features import structured_feature_matrix_from_asts, structured_feature
 from .tf_model import require_tensorflow
 
 
+FEATURE_MODES = ("text_only", "text_ast")
+
+
 class TensorFlowTaskModel:
     def __init__(self, model: Any, metadata: dict[str, Any]) -> None:
         self.model = model
@@ -159,14 +162,17 @@ class TensorFlowTaskModel:
         prompts: list[str],
         *,
         batch_size: int = 128,
+        feature_mode: str = "text_ast",
     ) -> list[dict[str, Any]]:
         """Predict with only the neural heads, without structural fusion.
 
-        This is intentionally separate from :meth:`predict`, whose output is
-        the downstream router contract and includes TaskTagger evidence.  It
-        exists for honest evaluation of the saved TensorFlow artifact.
+        ``feature_mode='text_ast'`` is the production input.  The
+        ``text_only`` mode zeros the structured branch for ablation only; it
+        does not change the saved architecture or production contract.
         """
 
+        if feature_mode not in FEATURE_MODES:
+            raise ValueError("feature_mode must be 'text_only' or 'text_ast'")
         if any(not str(prompt).strip() for prompt in prompts):
             raise ValueError("prompts must not contain empty text")
         if not prompts:
@@ -175,7 +181,11 @@ class TensorFlowTaskModel:
         prompt_values = [str(prompt) for prompt in prompts]
         task_asts = [extract_evidence(prompt) for prompt in prompt_values]
         raw = self.model.predict(
-            self._model_inputs(prompt_values, task_asts=task_asts),
+            self._model_inputs(
+                prompt_values,
+                task_asts=task_asts,
+                feature_mode=feature_mode,
+            ),
             batch_size=batch_size,
             verbose=0,
         )
@@ -198,6 +208,7 @@ class TensorFlowTaskModel:
         prompts: list[str],
         *,
         task_asts: list[TaskAST] | None = None,
+        feature_mode: str = "text_ast",
     ) -> Any:
         """Build inputs for both new two-branch and legacy text-only artifacts."""
 
@@ -206,7 +217,14 @@ class TensorFlowTaskModel:
         text_input = tf.constant(normalized)
         if self.structured_feature_dim <= 0:
             return text_input
-        if task_asts is None:
+        if feature_mode not in FEATURE_MODES:
+            raise ValueError("feature_mode must be 'text_only' or 'text_ast'")
+        if feature_mode == "text_only":
+            features = [
+                [0.0] * self.structured_feature_dim
+                for _ in prompts
+            ]
+        elif task_asts is None:
             features = structured_feature_matrix(prompts)
         else:
             if len(task_asts) != len(prompts):
