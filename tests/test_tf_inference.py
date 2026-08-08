@@ -70,6 +70,10 @@ class TensorFlowInferenceContractTest(unittest.TestCase):
         self.assertEqual(result["workload_type"], "text")
         self.assertEqual(result["predictions"]["workload_type"]["probability"], 0.8)
         self.assertTrue(result["evidence"])
+        self.assertEqual(result["task_ir"]["contract_version"], "task-ir-v1")
+        self.assertEqual(result["task_ir"]["workload_type"]["label"], "text")
+        self.assertIn("capability_demand", result["task_ir"])
+        self.assertEqual(result["task_ir"]["fusion"]["post_hoc_probability_fusion"], False)
         self.assertEqual(result["fusion"]["task_ast_schema"], "task-ast-v1")
         self.assertFalse(result["fusion"]["post_hoc_probability_fusion"])
         self.assertNotIn("structural_teacher", result["fusion"])
@@ -101,6 +105,7 @@ class TensorFlowInferenceContractTest(unittest.TestCase):
             raw["predictions"]["workload_type"]["probability"],
         )
         self.assertTrue(raw["evidence"])
+        self.assertEqual(raw["task_ir"]["contract_version"], "task-ir-v1")
         self.assertFalse(raw["fusion"]["post_hoc_probability_fusion"])
         self.assertTrue(all(value == 0.0 for value in model.inputs[-1]["structured_features"][0]))
 

@@ -217,6 +217,7 @@ analysis = json.loads(response.choices[0].message.content)
 | `predictions` | `object` | 带 probability 和 Top 3 candidates 的推荐结构 |
 | `effort` | `object` | effort bucket、粗略分钟数、区间和监督来源 |
 | `evidence` | `array` | 可观察的结构化信号，不是模型自由生成的解释 |
+| `task_ir` | `object` | 与 prototype `TaskIR.to_contract()` 相同的 canonical Router contract |
 | `fusion` | `object` | TensorFlow 模型、TaskAST schema 和是否启用 post-hoc probability fusion |
 | `needs_clarification` | `boolean` | 是否需要补充信息或人工确认 |
 | `clarification_reasons` | `array[string]` | 触发澄清的原因 |
@@ -242,6 +243,23 @@ analysis = json.loads(response.choices[0].message.content)
 `probability` 是该 TensorFlow head 输出分布中选中类别的分数，范围为 `[0, 1]`。TaskAST 已经作为结构化输入参与模型计算，但推理阶段不会再把 evidence 作为第二次规则概率修正。该分数适合做候选排序、阈值判断和模型选择权重，不应直接解释成“模型有 81% 的真实正确率”。当前还没有足够的独立 gold 数据进行 calibration。
 
 `candidates` 只展示 Top 3。完整内部分布的总和为 1，但 Top 3 的分数加起来通常小于 1。
+
+### `task_ir` canonical contract
+
+`task_ir` 是 TensorFlow 与 prototype 的共同接口，版本由
+`task_ir.contract_version == "task-ir-v1"` 标识。下游 Router 新代码应优先读取它，
+而不是依赖 TensorFlow 为兼容旧 Router 保留的顶层 scalar 字段。
+
+它包含：
+
+- `intent`、`domains`、`workload_type`：统一的 `label + probability + candidates`；
+- `artifact`、`operations`、`language`、`constraints`；
+- `capability_demand`、`complexity`、`effort`、`risk_level`；
+- `confidence`、`needs_clarification`、`evidence`、`fusion` 和 `model_version`。
+
+TensorFlow 当前没有独立训练的 domain/artifact heads，因此 canonical contract 中
+这两个字段明确来自 TaskAST evidence，不会伪装成神经 head 的输出。prototype 的
+`TaskIR.to_dict()` 同时保留旧的直接字段，并增加同样的 `task_ir` canonical object。
 
 分类标签集合：
 

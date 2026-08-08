@@ -16,6 +16,7 @@ from .tf_data import (
 )
 from .evidence import extract_evidence
 from .task_ast import TaskAST
+from .task_ir import TaskIR
 from .tf_features import structured_feature_matrix_from_asts, structured_feature_matrix
 from .tf_model import require_tensorflow
 
@@ -116,6 +117,28 @@ class TensorFlowTaskModel:
             ),
             4,
         )
+        confidence_payload = {
+            "workload_type": round(workload_confidence, 4),
+            "intent": round(intent_confidence, 4),
+            "complexity": round(complexity_confidence, 4),
+            "effort": effort_payload["confidence"],
+            "overall": overall_confidence,
+        }
+        fusion_metadata = {
+            "semantic_model": self.model_id,
+            "task_ast_schema": task_ast.schema_version,
+            "post_hoc_probability_fusion": False,
+            "policy": "TensorFlow consumes TaskAST features internally; inference returns evidence without post-hoc probability fusion",
+        }
+        task_ir = TaskIR.from_tensorflow(
+            predictions=prediction_payload,
+            effort=effort_payload,
+            task_ast=task_ast,
+            confidence=confidence_payload,
+            needs_clarification=needs_clarification,
+            model_version=str(self.metadata.get("model_version", "0.1.0")),
+            fusion=fusion_metadata,
+        )
 
         return {
             "original_prompt": prompt,
@@ -127,12 +150,8 @@ class TensorFlowTaskModel:
             "complexity": complexity,
             "predictions": prediction_payload,
             "evidence": structural_evidence,
-            "fusion": {
-                "semantic_model": self.model_id,
-                "task_ast_schema": task_ast.schema_version,
-                "post_hoc_probability_fusion": False,
-                "policy": "TensorFlow consumes TaskAST features internally; inference returns evidence without post-hoc probability fusion",
-            },
+            "task_ir": task_ir.to_contract(),
+            "fusion": fusion_metadata,
             "effort": {
                 "bucket": effort_payload["label"],
                 "estimated_minutes": effort_payload["estimated_minutes"],
@@ -142,13 +161,7 @@ class TensorFlowTaskModel:
             },
             "needs_clarification": needs_clarification,
             "clarification_reasons": reasons,
-            "confidence": {
-                "workload_type": round(workload_confidence, 4),
-                "intent": round(intent_confidence, 4),
-                "complexity": round(complexity_confidence, 4),
-                "effort": effort_payload["confidence"],
-                "overall": overall_confidence,
-            },
+            "confidence": confidence_payload,
             "model_version": self.metadata.get("model_version", "0.1.0"),
         }
 
@@ -199,6 +212,7 @@ class TensorFlowTaskModel:
                 self.metadata,
                 effort_bucket_labels=self.effort_bucket_labels,
                 evidence=[item.to_dict() for item in task_asts[index].evidence],
+                task_ast=task_asts[index],
             )
             for index, prompt in enumerate(prompt_values)
         ]
@@ -278,6 +292,7 @@ def _raw_prediction_payload(
     *,
     effort_bucket_labels: list[str] | None = None,
     evidence: list[dict[str, Any]] | None = None,
+    task_ast: TaskAST | None = None,
 ) -> dict[str, Any]:
     """Build the evaluation contract from neural outputs only."""
 
@@ -296,7 +311,55 @@ def _raw_prediction_payload(
         effort_bucket_labels=effort_bucket_labels or list(EFFORT_BUCKET_ORDER),
     )
 
-    return {
+    confidence_payload = {
+        "workload_type": round(max(workload_probabilities), 4),
+        "intent": round(max(intent_probabilities), 4),
+        "complexity": round(max(complexity_probabilities), 4),
+        "effort": effort_payload["confidence"],
+        "overall": round(
+            0.30 * max(workload_probabilities)
+            + 0.30 * max(intent_probabilities)
+            + 0.25 * max(complexity_probabilities)
+            + 0.15 * float(effort_payload["confidence"]),
+            4,
+        ),
+    }
+    fusion_metadata = {
+        "semantic_model": metadata.get("model_id", "trendmodel-text-v1"),
+        "task_ast_schema": metadata.get("task_ast_schema", TaskAST.schema_version),
+        "post_hoc_probability_fusion": False,
+        "policy": "TensorFlow consumes TaskAST features internally; raw output exposes neural probabilities without post-hoc fusion",
+    }
+    task_ir = None
+    if task_ast is not None:
+        task_ir = TaskIR.from_tensorflow(
+            predictions={
+                "workload_type": _classification_payload(
+                    workload_type,
+                    workload_probabilities,
+                    workload_labels,
+                ),
+                "intent": _classification_payload(
+                    intent,
+                    intent_probabilities,
+                    intent_labels,
+                ),
+                "complexity": _classification_payload(
+                    complexity,
+                    complexity_probabilities,
+                    complexity_labels,
+                ),
+                "effort": effort_payload,
+            },
+            effort=effort_payload,
+            task_ast=task_ast,
+            confidence=confidence_payload,
+            needs_clarification=clarification_probability >= 0.5,
+            model_version=str(metadata.get("model_version", "0.1.0")),
+            fusion=fusion_metadata,
+        )
+
+    result = {
         "original_prompt": prompt,
         "workload_type": workload_type,
         "intent": intent,
@@ -328,26 +391,12 @@ def _raw_prediction_payload(
         },
         "evidence": list(evidence or []),
         "needs_clarification": clarification_probability >= 0.5,
-        "confidence": {
-            "workload_type": round(max(workload_probabilities), 4),
-            "intent": round(max(intent_probabilities), 4),
-            "complexity": round(max(complexity_probabilities), 4),
-            "effort": effort_payload["confidence"],
-            "overall": round(
-                0.30 * max(workload_probabilities)
-                + 0.30 * max(intent_probabilities)
-                + 0.25 * max(complexity_probabilities)
-                + 0.15 * float(effort_payload["confidence"]),
-                4,
-            ),
-        },
-        "fusion": {
-            "semantic_model": metadata.get("model_id", "trendmodel-text-v1"),
-            "task_ast_schema": metadata.get("task_ast_schema", TaskAST.schema_version),
-            "post_hoc_probability_fusion": False,
-            "policy": "TensorFlow consumes TaskAST features internally; raw output exposes neural probabilities without post-hoc fusion",
-        },
+        "confidence": confidence_payload,
+        "fusion": fusion_metadata,
     }
+    if task_ir is not None:
+        result["task_ir"] = task_ir.to_contract()
+    return result
 
 
 def _first_value(raw: Any, name: str) -> float:

@@ -323,9 +323,9 @@ Task IR 不是以下任何东西：
 - 不是最终生成答案；
 - 不是工具权限或安全审批；`execute` 和 `high_risk` 仍需下游策略确认。
 
-原型 `TaskTagger` 直接构造 `TaskIR` dataclass，字段包括 `intent`、`domains`、`workload_type`、`artifact`、`operations`、`language`、`constraints`、`capability_demand`、`complexity`、`effort`、`risk_level`、`confidence`、`needs_clarification` 和 `evidence`（实现见 [`trendmodel/task_ir.py`](../trendmodel/task_ir.py) 和 [`trendmodel/tagger.py`](../trendmodel/tagger.py)）。
+原型 `TaskTagger` 直接构造 `TaskIR` dataclass，字段包括 `intent`、`domains`、`workload_type`、`artifact`、`operations`、`language`、`constraints`、`capability_demand`、`complexity`、`effort`、`risk_level`、`confidence`、`needs_clarification` 和 `evidence`（实现见 [`trendmodel/task_ir.py`](../trendmodel/task_ir.py) 和 [`trendmodel/tagger.py`](../trendmodel/tagger.py)）。`TaskIR.to_dict()` 保留 prototype 的旧直接字段，并增加 `task_ir` canonical object。
 
-TensorFlow 主模型的 `TensorFlowTaskModel.predict()` 返回的是语义等价的 JSON contract，但为了兼容现有 Router，当前最外层主要暴露 `workload_type`、`intent`、`complexity`、`predictions`、`effort`、`evidence`、`fusion`、`confidence` 和 `needs_clarification`（实现见 [`trendmodel/tf_inference.py`](../trendmodel/tf_inference.py)）。它不是 `TaskIR` dataclass 的逐字段复制；例如 prototype 路径的 `domains`、`artifact` 和 `capability_demand` 目前主要保留在 TaskTagger 路径，TensorFlow JSON 则通过 evidence 和三类主要 heads 提供路由信息。
+TensorFlow 主模型的 `TensorFlowTaskModel.predict()` 为兼容现有 Router 保留最外层的 `workload_type`、`intent`、`complexity`、`predictions` 等字段，同时通过 `TaskIR.from_tensorflow()` 生成 `task_ir` canonical object（实现见 [`trendmodel/task_ir.py`](../trendmodel/task_ir.py) 和 [`trendmodel/tf_inference.py`](../trendmodel/tf_inference.py)）。它与 prototype 共享 `task_ir.contract_version == "task-ir-v1"` 的字段集合；TensorFlow 当前没有独立的 domain/artifact heads，因此这两类字段在 canonical object 中明确标记为 TaskAST-derived 的候选，而不是伪造神经输出。
 
 #### 3.3.1 TaskAST 与 Task IR 的区别
 
@@ -338,7 +338,7 @@ TensorFlow 主模型的 `TensorFlowTaskModel.predict()` 返回的是语义等价
 | 分数含义 | 规则匹配强度或候选支持度 | head 输出/融合后的 posterior-like score |
 | 是否保存风险事实 | 是，保存 `high_risk` 和原因 | 是，转换成 Router 可检查的风险字段或 evidence |
 | 是否直接给 Router | 通常不直接给 | 是，Task IR/JSON 是接口 |
-| 当前代码 | `TaskAST`，由 `extract_evidence()` 返回 | `TaskIR` dataclass 或 TensorFlow JSON contract |
+| 当前代码 | `TaskAST`，由 `extract_evidence()` 返回 | `TaskIR.to_contract()`；TensorFlow 和 prototype 都通过 `task_ir` 暴露 |
 | 能否代替权限系统 | 不能 | 不能 |
 
 最容易混淆的地方是：TaskAST 和 Task IR 都可以出现 `intent`、`domain` 或 `evidence` 这些词，但它们在不同阶段含义不同。举例：
@@ -348,10 +348,10 @@ TaskAST.intent_scores["execute"] = 0.98
     = 规则发现了强执行语义
 
 TaskIR.intent.probability = 0.61
-    = 语义模型和结构化证据融合后，最终 execute 候选的分数
+    = 该路径对 execute 候选的归一化输出分数
 ```
 
-前者说明“文本里有什么信号”，后者说明“整个系统当前准备把它当成什么”。两者不能直接当作同一个 probability 比较。
+前者说明“文本里有什么信号”，后者说明“该路径当前准备把它当成什么”。两者不能直接当作同一个 probability 比较。
 
 #### 3.3.2 当前代码中的数据流
 
@@ -377,20 +377,20 @@ TaskAST
       │
       └──────────────► TaskTagger prototype + fusion ──► prototype TaskIR
 
-raw predictions + selected high-confidence evidence
+raw predictions + TaskAST evidence
       │
       ▼
-head-specific Bayesian-style fusion + uncertainty diagnostics
+TaskIR.from_tensorflow() / TaskIR.to_contract()
       │
       ▼
-TensorFlow JSON contract / router-facing Task IR
+shared task_ir canonical contract
 ```
 
 有三个实现边界需要明确：
 
 1. `TaskAST` 现在已经是正式 dataclass，不再是只存在于文档中的概念；
-2. `TaskIR` dataclass 主要由 prototype `TaskTagger` 路径生成；
-3. TensorFlow 主模型输出的是与 Task IR 语义对应的 JSON contract，不是把 `TaskIR` dataclass 原封不动复制一遍。
+2. prototype `TaskTagger` 和 TensorFlow adapter 都生成同一版本的 canonical `task_ir`；
+3. TensorFlow 顶层仍保留旧字段，但新 Router 应读取 canonical object，而不是依赖某一模型的兼容包装。
 
 因此，TaskAST 是“证据层”，Task IR 是“路由接口层”。前者帮助我们知道模型为什么有这样的候选，后者帮助下游稳定地使用结果。
 
@@ -1625,7 +1625,7 @@ Salesforce AI Research. (n.d.). *xLAM function calling 60K* [Data set]. Hugging 
 - [`trendmodel/tf_features.py`](../trendmodel/tf_features.py)：56 维结构化特征向量。
 - [`trendmodel/tf_model.py`](../trendmodel/tf_model.py)：字符向量化、BiGRU、n-gram TF-IDF、结构分支和多任务 heads。
 - [`trendmodel/tf_data.py`](../trendmodel/tf_data.py)：记录解析、label map、group split、类别平衡、replay 和 sample-weight mask。
-- [`trendmodel/tf_inference.py`](../trendmodel/tf_inference.py)：raw/inference 推理、TaskAST evidence、effort basis、uncertainty diagnostics 和 JSON contract。
+- [`trendmodel/tf_inference.py`](../trendmodel/tf_inference.py)：raw/inference 推理、TaskAST evidence、`TaskIR.from_tensorflow()` 适配、effort basis、uncertainty diagnostics 和 JSON contract。
 - [`trendmodel/tf_train.py`](../trendmodel/tf_train.py)：训练、评估、保存、reload round-trip 和 metadata。
 - [`trendmodel/train.py`](../trendmodel/train.py)、[`trendmodel/public_data.py`](../trendmodel/public_data.py)、[`trendmodel/local_data.py`](../trendmodel/local_data.py)、[`trendmodel/data_cleaning.py`](../trendmodel/data_cleaning.py)：本地数据准备、adapter 和清洗边界。
 

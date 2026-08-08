@@ -12,6 +12,7 @@
     "predictions",
     "effort",
     "evidence",
+    "task_ir",
     "fusion",
     "needs_clarification",
     "clarification_reasons",
@@ -35,6 +36,7 @@
       "additionalProperties": true
     },
     "effort": {"$ref": "#/$defs/effort"},
+    "task_ir": {"$ref": "#/$defs/taskIR"},
     "evidence": {
       "type": "array",
       "items": {"$ref": "#/$defs/evidence"}
@@ -170,6 +172,103 @@
         "value": {"type": ["string", "boolean", "number"]},
         "strength": {"$ref": "#/$defs/probability"},
         "detail": {"type": "string"}
+      },
+      "additionalProperties": true
+    },
+    "taskIR": {
+      "type": "object",
+      "required": [
+        "contract_version",
+        "original_prompt",
+        "intent",
+        "domains",
+        "workload_type",
+        "artifact",
+        "artifact_probability",
+        "operations",
+        "language",
+        "constraints",
+        "capability_demand",
+        "complexity",
+        "effort",
+        "risk_level",
+        "confidence",
+        "needs_clarification",
+        "evidence",
+        "fusion",
+        "model_version"
+      ],
+      "properties": {
+        "contract_version": {"const": "task-ir-v1"},
+        "original_prompt": {"type": "string"},
+        "intent": {"$ref": "#/$defs/classificationHead"},
+        "domains": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/classificationHead"}
+        },
+        "workload_type": {"$ref": "#/$defs/classificationHead"},
+        "artifact": {"type": "string"},
+        "artifact_probability": {"$ref": "#/$defs/probability"},
+        "operations": {"type": "array", "items": {"type": "string"}},
+        "language": {"type": ["string", "null"]},
+        "constraints": {"$ref": "#/$defs/taskConstraints"},
+        "capability_demand": {"$ref": "#/$defs/capabilityDemand"},
+        "complexity": {"$ref": "#/$defs/classificationHead"},
+        "effort": {"$ref": "#/$defs/effort"},
+        "risk_level": {"type": "string", "enum": ["low", "medium", "high"]},
+        "confidence": {
+          "type": "object",
+          "required": ["overall"],
+          "properties": {"overall": {"$ref": "#/$defs/probability"}},
+          "additionalProperties": {"$ref": "#/$defs/probability"}
+        },
+        "needs_clarification": {"type": "boolean"},
+        "evidence": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/evidence"}
+        },
+        "fusion": {"$ref": "#/$defs/fusionMetadata"},
+        "model_version": {"type": "string"}
+      },
+      "additionalProperties": true
+    },
+    "taskConstraints": {
+      "type": "object",
+      "properties": {
+        "requires_files": {"type": "boolean"},
+        "requires_tools": {"type": "boolean"},
+        "has_code_block": {"type": "boolean"},
+        "has_file_paths": {"type": "boolean"},
+        "has_shell_commands": {"type": "boolean"},
+        "has_math_symbols": {"type": "boolean"},
+        "has_urls": {"type": "boolean"}
+      },
+      "additionalProperties": true
+    },
+    "capabilityDemand": {
+      "type": "object",
+      "required": ["reasoning", "coding", "context", "tool_use"],
+      "properties": {
+        "reasoning": {"$ref": "#/$defs/probability"},
+        "coding": {"$ref": "#/$defs/probability"},
+        "context": {"$ref": "#/$defs/probability"},
+        "tool_use": {"$ref": "#/$defs/probability"}
+      },
+      "additionalProperties": true
+    },
+    "fusionMetadata": {
+      "type": "object",
+      "required": [
+        "semantic_model",
+        "task_ast_schema",
+        "post_hoc_probability_fusion",
+        "policy"
+      ],
+      "properties": {
+        "semantic_model": {"type": "string"},
+        "task_ast_schema": {"type": "string"},
+        "post_hoc_probability_fusion": {"type": "boolean"},
+        "policy": {"type": "string"}
       },
       "additionalProperties": true
     }

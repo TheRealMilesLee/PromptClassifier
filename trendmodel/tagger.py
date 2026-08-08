@@ -180,6 +180,19 @@ class TaskTagger:
             confidence=clamp_probability(overall_confidence),
             needs_clarification=needs_clarification,
             evidence=evidence.signals,
+            model_version=self.model_version,
+            fusion={
+                "semantic_model": self.model_version,
+                "task_ast_schema": evidence.schema_version,
+                "post_hoc_probability_fusion": True,
+                "policy": "prototype semantic, structural and optional context fusion",
+            },
+            confidence_by_head={
+                "intent": intent_confidence,
+                "domain": domain_confidence,
+                "workload_type": confidence(workload_fusion.posterior),
+                "complexity": complexity.probability,
+            },
         )
 
     def predict_many(

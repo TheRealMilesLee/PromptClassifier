@@ -24,6 +24,9 @@ class TaskTaggerTest(unittest.TestCase):
         self.assertEqual(result["operations"], ["multithreading", "cartesian_product"])
         self.assertFalse(result["constraints"]["requires_tools"])
         self.assertGreater(result["capability_demand"]["coding"], 0.8)
+        self.assertEqual(result["task_ir"]["contract_version"], "task-ir-v1")
+        self.assertEqual(result["task_ir"]["workload_type"]["label"], "code")
+        self.assertTrue(result["task_ir"]["fusion"]["post_hoc_probability_fusion"])
         json.dumps(result, ensure_ascii=False)
 
         python_result = self.tagger.predict("实现一个 Python 函数，把 CSV 转换成 JSON").to_dict()
