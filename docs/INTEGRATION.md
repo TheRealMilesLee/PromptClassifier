@@ -2,7 +2,12 @@
 
 本文档是另一个项目接入 TrendModel 的主入口。TrendModel 只负责把用户 prompt 转换成路由标签和不确定性信息，不负责生成最终答案、选择具体供应商模型或执行工具。
 
-当前推荐 artifact：`trendmodel-text-v1`。重新训练后模型版本为 `0.5.0`，它包含内置 TaskAST structured feature branch、受控类别重加权、`effort_bucket` 分类头、ordinal effort head 和 abstention policy；已有 text-only/旧 bucket artifact 仍可被兼容加载。
+当前推荐 artifact：`trendmodel-text-v1`。重新训练后模型版本为 `0.5.0`，默认
+`metadata.architecture_family=bigru`，包含内置 TaskAST structured feature branch、
+受控类别重加权、`effort_bucket` 分类头、ordinal effort head 和 abstention policy；
+已有 text-only/旧 bucket artifact 仍可被兼容加载。仓库还提供
+`architecture_family=transformer-challenger` 的可选对比 artifact；它使用相同的
+TaskAST、heads 和 JSON contract，但不能因为架构不同就直接与主模型的指标混写。
 
 ## 1. 选择接入方式
 
@@ -51,6 +56,21 @@ artifacts/trendmodel-text-v1/
 ├── model.keras
 └── metadata.json
 ```
+
+加载前建议检查 `metadata.json`：
+
+```json
+{
+  "model_id": "trendmodel-text-v1",
+  "model_version": "0.5.0",
+  "architecture_family": "bigru",
+  "post_hoc_probability_fusion": false
+}
+```
+
+如果使用 challenger，`architecture_family` 应为
+`transformer-challenger`。下游接口不需要根据这个字段分支解析 JSON，但应把它
+记录到路由日志，便于比较延迟、质量和回滚来源。
 
 ### 最小调用
 
@@ -428,6 +448,15 @@ python -m trendmodel.train prepare \
   --batch-size 16 \
   --require-gpu
 
+# 可选：训练 Transformer challenger，使用独立 artifact 进行对比
+.venv-tf/bin/python -m trendmodel.train train \
+  --data data/processed/training.jsonl \
+  --artifact artifacts/trendmodel-text-v1-transformer \
+  --architecture transformer-challenger \
+  --epochs 10 \
+  --batch-size 16 \
+  --require-gpu
+
 # 保存后的本地评估
 .venv-tf/bin/python -m trendmodel.train evaluate \
   --data data/processed/training.jsonl \
@@ -485,7 +514,8 @@ artifacts/trendmodel-text-v1/
 2. `metadata.model_version` 是否在兼容范围内；
 3. `metadata.labels` 是否包含下游支持的 label；
 4. `metadata.effort_bucket_supervision_samples`、`effort_minutes_supervision_samples`、`effort_supervision_samples` 和 `observed_effort_samples` 是否满足要求；
-5. 模型文件 checksum 是否与发布清单一致。
+5. `metadata.architecture_family` 是否是经过评估和批准的 `bigru` 或 challenger；
+6. 模型文件 checksum 是否与发布清单一致。
 
 原始数据、清洗数据、模型 artifact 和 Python 虚拟环境都被 `.gitignore` 忽略，不应通过 Git 传递。建议使用内部 artifact storage、受控文件复制或带 checksum 的压缩包。
 

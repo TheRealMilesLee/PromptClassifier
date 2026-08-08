@@ -16,7 +16,7 @@
 
 ## 相关工作与本文定位
 
-本系统吸收了几个成熟方向的思想：TF-IDF 用于提供高效的词法/字符片段信号（Salton & Buckley, 1988）；GRU 和双向循环网络用于建模序列上下文（Cho et al., 2014; Schuster & Paliwal, 1997）；多任务学习通过共享表示同时优化相关任务（Caruana, 1997）；句向量模型可以把整句映射到适合相似度比较的语义空间（Reimers & Gurevych, 2019）；概率校准则用于把模型分数转化为更可信的置信度（Guo et al., 2017）。TrendModel 的区别在于目标不是通用问答或单一 intent 分类，而是把用户请求转换为 Auto Router 可消费的任务能力描述，并且显式保留结构化证据、标签来源和不确定性。
+本系统吸收了几个成熟方向的思想：TF-IDF 用于提供高效的词法/字符片段信号（Salton & Buckley, 1988）；GRU 和双向循环网络用于建模序列上下文（Cho et al., 2014; Schuster & Paliwal, 1997）；Transformer 的自注意力机制为可比较的 challenger 提供了另一种序列建模方式（Vaswani et al., 2017）；多任务学习通过共享表示同时优化相关任务（Caruana, 1997）；句向量模型可以把整句映射到适合相似度比较的语义空间（Reimers & Gurevych, 2019）；概率校准则用于把模型分数转化为更可信的置信度（Guo et al., 2017）。TrendModel 的区别在于目标不是通用问答或单一 intent 分类，而是把用户请求转换为 Auto Router 可消费的任务能力描述，并且显式保留结构化证据、标签来源和不确定性。
 
 本文不是一份声称已经达到某个 benchmark 的实验论文，而是一份和当前代码同步的系统设计论文。所有“当前实现”描述均以仓库中的 TensorFlow、数据管线和推理代码为准；所有“未来”描述都单独标注。
 
@@ -114,23 +114,27 @@ needs_clarification ∈ {false, true}
 ```mermaid
 flowchart TD
     A["用户 prompt"] --> B["清洗与规范化"]
-    B --> C["文本语义编码"]
-    B --> D["结构化证据提取"]
-    C --> E["多任务分类 heads"]
-    D --> F["语言、文件、命令、工具、风险特征"]
-    E --> G["概率与不确定性"]
-    F --> G
-    G --> H["受限证据融合"]
-    H --> I["Task IR / JSON contract"]
-    I --> J["Auto Router"]
-    J --> K["模型选择、成本策略与权限检查"]
+    B --> C["字符文本编码器"]
+    B --> D["TaskAST 结构化证据提取"]
+    C --> E["BiGRU 主模型 / Transformer challenger"]
+    D --> F["56 维结构化特征"]
+    C --> G["字符 n-gram TF-IDF"]
+    E --> H["多任务 heads"]
+    F --> H
+    G --> H
+    D --> I["可审计 evidence"]
+    H --> J["calibration + uncertainty + abstention"]
+    J --> K["Task IR / JSON contract"]
+    I --> K
+    K --> L["Auto Router"]
+    L --> M["模型选择、成本策略与权限检查"]
 ```
 
 先记住三句话：
 
 1. **Task AST 是证据层**：它记录 prompt 中观察到的事实和多个候选解释；
-2. **Task IR 是接口层**：它把融合后的任务判断整理成 Router 可以消费的稳定结构；
-3. **Bayesian-style fusion 是更新层**：它把语义模型、结构证据和上下文分数合在一起，并把冲突暴露为不确定性。
+2. **Task IR 是接口层**：它把模型判断、结构 evidence 和不确定性整理成 Router 可以消费的稳定结构；
+3. **Bayesian-style fusion 是可选更新层**：它保留在 prototype `TaskTagger` 的证据融合和未来上下文更新中；当前 TensorFlow 主模型把 TaskAST 编码成输入，推理时不再对已产生的 probability 做第二次规则融合。
 
 ### 3.1 Task AST：把 prompt 转成可计算的任务证据
 
@@ -595,9 +599,11 @@ Output:
     where A contains language, actions, domains, artifact hints,
     operations, constraints, risk and observable evidence.
 4.  s_struct ← EncodeStructuredFeatures(A)        # current width: 56
-5.  h_char ← BiGRU(Embedding(CharacterVectorize(x_model)))
+5.  h_text ← Encoder_arch(Embedding(CharacterVectorize(x_model)))
+    where arch = BiGRU for the production baseline;
+    arch = lightweight Transformer encoder for the challenger.
 6.  h_ngram ← Dense(CharacterNgramTFIDF(x_model))
-7.  h ← Fuse(h_char, h_ngram, Dense(s_struct))
+7.  h ← Fuse(h_text, h_ngram, Dense(s_struct))
 8.  p_raw ← MultiTaskHeads(h)
     where heads = workload, intent, complexity, effort_bucket,
     effort_ordinal, effort_log_minutes and needs_clarification.
@@ -609,7 +615,7 @@ Output:
 13. clarification ← ApplyClarificationPolicy(p_raw, x_raw, abstention)
 14. y ← BuildTaskIRJSON(x_raw, predictions=p_raw, effort, evidence,
                          abstention, fusion_metadata, uncertainty)
-14. return y
+15. return y
 ```
 
 步骤 3 先生成一份 TaskAST；步骤 4 把这份 AST 编码成 56 维结构化输入，步骤 9 返回同一份 AST 的 evidence，避免训练输入和审计输出来自两套规则。步骤 10–13 都不会把证据再混入分类概率；abstention 只读取已经产生的概率和不确定性，不修改 label。`needs_clarification` 是独立的路由安全信号。旧的 `TaskTagger` 仍可作为 prototype 运行，但不再是 TensorFlow 主推理的第二个概率来源。
@@ -903,6 +909,46 @@ flowchart LR
 
 这个分支不是最终语义理解器，而是帮助小模型快速捕捉任务形状和高频表达。
 
+#### 6.2.1 Transformer challenger
+
+`build_transformer_challenger()` 使用与主模型相同的字符向量化和 n-gram 分支，
+但把 BiGRU 序列编码器替换为以下结构：
+
+```text
+character ids
+  → character Embedding(96) + learned positional Embedding
+  → 2 × [Multi-Head Self-Attention(4 heads) + residual + LayerNorm
+       + feed-forward(192 → 96) + residual + LayerNorm]
+  → global average pooling
+  → Dense(128)
+```
+
+它的研究问题是：在相同 TaskAST 和相同监督下，自注意力是否能改善 Router 真正关心
+的边界，而不是证明 Transformer 在一般意义上优于 RNN。至少需要在同一固定 split、
+同一 gold/hard-negative 集和同一 calibration 流程中比较：
+
+| 维度 | 必须观察的指标 | 选择含义 |
+| --- | --- | --- |
+| 分类质量 | workload/intent/complexity accuracy、macro-F1、混淆矩阵 | 是否真正改善任务边界 |
+| effort | bucket accuracy、observed active-minutes MAE | 是否改善工作量排序，而非只改变分布 |
+| 置信度 | NLL、ECE、abstention coverage 和 selective error | 是否能更可靠地把不确定请求交给 fallback |
+| 工程成本 | 单条/批量 latency、峰值内存、artifact 大小 | 是否满足本地 Router 的低延迟约束 |
+
+如果 challenger 只提高训练集或弱标签 validation 的分数，却没有在独立 gold 和
+hard-negative 上稳定获胜，生产模型继续使用 BiGRU。训练 challenger 的入口为：
+
+```bash
+python3 -m trendmodel.train train \
+  --data data/processed/prompts.cleaned.jsonl \
+  --artifact artifacts/trendmodel-text-v1-transformer \
+  --architecture transformer-challenger \
+  --epochs 20
+```
+
+artifact 的 `metadata.json` 用 `architecture_family` 区分 `bigru` 和
+`transformer-challenger`，下游加载代码不需要改变；发布检查应明确记录实际架构，
+不要只依据 `model_id` 判断两个 artifact 是否相同。
+
 ### 6.3 结构化特征分支
 
 当前固定宽度为 56 维，分为：
@@ -918,7 +964,9 @@ flowchart LR
 
 结构化特征的作用是把高置信事实显式暴露给模型。例如，模型不需要只靠 192 个字符 token 自己猜测某个 prompt 是否包含代码块或 Shell 命令。
 
-这不是把规则硬编码成最终答案。结构化特征进入训练模型，同时在推理阶段作为受限 evidence 参与融合，最终仍然保留神经模型的不确定性。
+这不是把规则硬编码成最终答案。结构化特征进入训练模型；推理阶段返回同一份
+TaskAST 的受限 evidence 供审计，但不会再把规则分数拿出来对 TensorFlow
+probability 做第二次融合，最终仍然保留神经模型的不确定性。
 
 ## 7. 多任务学习与损失函数
 
@@ -1491,7 +1539,7 @@ flowchart LR
     C --> D["label maps + class weights"]
     D --> E["structured_feature_vector"]
     E --> F["tf.data with masked sample weights"]
-    F --> G["build_text_model"]
+    F --> G["build_text_model / build_transformer_challenger"]
     G --> H["Adam + multi-task fit"]
     H --> I["save model.keras"]
     I --> J["reload + raw round-trip evaluation"]
@@ -1510,6 +1558,13 @@ flowchart LR
 | random seed | `42` | 可复现实验初始化和切分 |
 | EarlyStopping | `patience=4`, restore best | 监控 `val_loss` |
 | ReduceLROnPlateau | factor `0.5`, patience `2`, min `1e-5` | 验证集停滞时降学习率 |
+
+默认 `architecture=bigru`，即字符 Embedding + BiGRU；传入
+`--architecture transformer-challenger` 时只替换文本序列编码器，保留 TaskAST
+结构分支、n-gram 分支、heads、loss 和输出 contract。训练 metadata 会记录
+`architecture_family`，因此两个 artifact 可以并存并进行离线对比。架构选择不是
+由“Transformer 更新”这一点自动决定，而要由独立 gold/hard-negative 数据上的
+macro-F1、ECE、abstention、latency 和 artifact 大小共同决定。
 
 ### 21.3 多任务目标函数
 
@@ -1564,10 +1619,10 @@ record with observed active_minutes:
 | `trendmodel/task_ast.py` | 正式 `TaskAST` dataclass、候选分数、风险和 evidence 的统一封装 | 是 |
 | `trendmodel/task_ir.py` | prototype 路径的 Task IR dataclass 和 JSON 序列化 | TaskTagger 路径 |
 | `trendmodel/prototypes.py` + `trendmodel/tagger.py` | 原型相似度、层级选择、结构化融合和解释性 Task IR | evidence teacher / 可选独立路径 |
-| `trendmodel/fusion.py` | cosine、softmax、加权融合、乘法 Bayesian-style 实验和不确定性 | 是 |
+| `trendmodel/fusion.py` | cosine、softmax、加权融合、乘法 Bayesian-style 实验和不确定性 | prototype / teacher |
 | `trendmodel/tf_features.py` | 把 AST-like evidence 转成固定 56 维向量 | 是 |
 | `trendmodel/tf_data.py` | TaskRecord、label map、split、类别权重、sample-weight mask、tf.data | 是 |
-| `trendmodel/tf_model.py` | Keras 模型结构、loss、optimizer 和 head | 是 |
+| `trendmodel/tf_model.py` | Keras BiGRU 主模型、Transformer challenger、loss、optimizer 和 heads | 是 |
 | `trendmodel/tf_train.py` | TensorFlow train/evaluate、保存、reload、metadata | 是 |
 | `trendmodel/tf_inference.py` | artifact load、raw/inference predict、TaskAST evidence、effort 转换和 JSON contract | 是 |
 | `trendmodel/api.py` | 本地 OpenAI-compatible HTTP 包装 | 可选 serving 层 |
@@ -1622,6 +1677,8 @@ Reimers, N., & Gurevych, I. (2019). Sentence-BERT: Sentence embeddings using Sia
 Salton, G., & Buckley, C. (1988). Term-weighting approaches in automatic text retrieval. *Information Processing & Management, 24*(5), 513–523. <https://doi.org/10.1016/0306-4573(88)90021-0>
 
 Schuster, M., & Paliwal, K. K. (1997). Bidirectional recurrent neural networks. *IEEE Transactions on Signal Processing, 45*(11), 2673–2681. <https://doi.org/10.1109/78.650093>
+
+Vaswani, A., Shazeer, N., Parmar, N., Uszkoreit, J., Jones, L., Gomez, A. N., Kaiser, Ł., & Polosukhin, I. (2017). Attention is all you need. *Advances in Neural Information Processing Systems, 30*. <https://papers.nips.cc/paper/7181-attention-is-all-you-need>
 
 ### 23.2 数据集与数据卡
 

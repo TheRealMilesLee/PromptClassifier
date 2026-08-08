@@ -24,23 +24,34 @@ TrendModel 是给 Auto Router 使用的轻量级 prompt 标签模型。它只负
 
 ## 当前架构
 
+当前生产 artifact 的 TensorFlow 主模型是 BiGRU 多任务模型；此前设计中的
+“句向量 + 原型分类 + 概率融合”描述的是仍然保留的 prototype/teacher 路径，
+不是 TensorFlow 推理时的第二次分类器。TensorFlow 的 TaskAST 已经作为结构化
+输入进入模型，推理时只把同一份 AST 的 evidence 返回给下游审计，不再用规则
+对神经网络 probability 做 post-hoc fusion。
+
 ```text
 用户 prompt
-   ↓
-句向量编码（可替换 backend）
-   ↓
-层级原型分类：intent / domain / artifact
-   ↓
-TaskAST：统一封装语言、文件、命令、数学符号、操作约束和风险 evidence
-   ↓
-概率融合：semantic 0.70 + structural 0.20 + context prior 0.10
-   ↓
-Task IR：标签、能力需求、风险、effort、置信度和证据
-   ↓
-另一个项目的 Auto Router
+   ├── 字符 TextVectorization → Embedding → BiGRU ─┐
+   ├── 字符 n-gram TF-IDF ──────────────────────────┤
+   └── TaskAST → 56 维结构化特征 ──────────────────┘
+                         ↓
+             多任务 heads + calibration/abstention
+                         ↓
+       Task IR / predictions / effort / evidence JSON
+                         ↓
+                  另一个项目的 Auto Router
 ```
 
-贝叶斯/概率层只做证据融合和不确定性管理，不承担中文语义理解。中文语义由句向量和原型完成；代码块、路径、Shell 命令、权限和生产环境等确定性信号由结构化提取器完成。
+贝叶斯式的概率思想仍用于不确定性、temperature scaling 和 abstention 的管理，
+但当前 TensorFlow 主链路不再把 TaskAST evidence 在推理后拿出来重新融合。代码块、
+路径、Shell 命令、权限和生产环境等确定性信号由 TaskAST 提取，并在训练阶段以
+结构化输入参与神经模型。
+
+Transformer 目前只作为 challenger：它复用相同的字符 n-gram 分支、TaskAST 输入、
+多任务 heads、数据切分和输出 contract。只有在同一份 gold/hard-negative 验证集上
+同时改善质量、校准、拒识表现，并且延迟和 artifact 大小仍满足 Router 约束时，才
+考虑替换默认 BiGRU。
 
 ## 快速运行
 
@@ -232,6 +243,13 @@ python3 -m trendmodel.train train \
   --artifact artifacts/trendmodel-text-v1 \
   --epochs 20
 
+# 可选 Transformer challenger；不会改变输出 JSON contract
+python3 -m trendmodel.train train \
+  --data data/processed/prompts.cleaned.jsonl \
+  --artifact artifacts/trendmodel-text-v1-transformer \
+  --architecture transformer-challenger \
+  --epochs 20
+
 python3 -m trendmodel.train evaluate \
   --data data/processed/prompts.cleaned.jsonl \
   --artifact artifacts/trendmodel-text-v1
@@ -241,7 +259,7 @@ python3 -m trendmodel.tf_train predict \
   "帮我实现一个 C++ 多线程程序"
 ```
 
-模型是 `TextVectorization(character) + Embedding + BiGRU + character n-gram TF-IDF branch + integrated TaskAST feature branch + multi-task heads`，同时预测 workload、intent、complexity、effort bucket、ordinal effort、effort minutes 和是否需要澄清。ordinal effort head 学习 `P(Y > XS)` 到 `P(Y > L)` 四个顺序阈值，再转换成 XS–XL 的分布，避免把相邻 effort 桶当成完全无关的类别。训练时对稀有类别使用 capped inverse-sqrt sample weighting，避免 `low` 或多数 workload 把 head 吸成单一类别；可信的人工/种子标签默认通过 `--gold-replay-multiplier 8` 做训练 replay，避免公共 weak/pseudo 数据淹没内部 gold。训练结束会在 validation split 上做 temperature scaling，保存每个 head 的温度、NLL 和 ECE；因此新 artifact 的完整 `distribution` 可作为经过校准的概率使用，旧 artifact 没有 calibration metadata 时仍按未校准分数解释。新 artifact 还启用 abstention：低概率、低 margin 或高 entropy 只会触发拒识和 `needs_clarification`，不会把 label 偷换成 unknown。TaskAST 在训练和推理时都作为 TensorFlow 的结构化输入特征，推理 JSON 原样返回可审计 evidence，但不会再由 TaskTagger 或规则对 TensorFlow 概率做 post-hoc fusion。除兼容旧字段外，TensorFlow 还返回与 prototype `TaskIR.to_contract()` 对齐的 `task_ir` canonical object。缺失字段通过 sample weight mask；公共数据可以训练分类头，但没有真实 effort supervision 时不会伪造分钟真值。保存的 artifact 包括 `model.keras` 和 `metadata.json`，推理 JSON 在保留旧 scalar 字段的同时，新增 `predictions` 完整分布、abstention 和 effort bucket candidates，方便 router 使用候选和置信度。旧的 text-only artifact 仍可加载，新训练产物使用模型版本 `0.5.0`。
+默认模型是 `TextVectorization(character) + Embedding + BiGRU + character n-gram TF-IDF branch + integrated TaskAST feature branch + multi-task heads`，同时预测 workload、intent、complexity、effort bucket、ordinal effort、effort minutes 和是否需要澄清。可选 challenger 把文本序列编码器替换为轻量 Transformer encoder，metadata 中的 `architecture_family` 会分别记录为 `bigru` 或 `transformer-challenger`；其余 TaskAST、heads、calibration 和输出 contract 保持一致。ordinal effort head 学习 `P(Y > XS)` 到 `P(Y > L)` 四个顺序阈值，再转换成 XS–XL 的分布，避免把相邻 effort 桶当成完全无关的类别。训练时对稀有类别使用 capped inverse-sqrt sample weighting，避免 `low` 或多数 workload 把 head 吸成单一类别；可信的人工/种子标签默认通过 `--gold-replay-multiplier 8` 做训练 replay，避免公共 weak/pseudo 数据淹没内部 gold。训练结束会在 validation split 上做 temperature scaling，保存每个 head 的温度、NLL 和 ECE；因此新 artifact 的完整 `distribution` 可作为经过校准的概率使用，旧 artifact 没有 calibration metadata 时仍按未校准分数解释。新 artifact 还启用 abstention：低概率、低 margin 或高 entropy 只会触发拒识和 `needs_clarification`，不会把 label 偷换成 unknown。TaskAST 在训练和推理时都作为 TensorFlow 的结构化输入特征，推理 JSON 原样返回可审计 evidence，但不会再由 TaskTagger 或规则对 TensorFlow 概率做 post-hoc fusion。除兼容旧字段外，TensorFlow 还返回与 prototype `TaskIR.to_contract()` 对齐的 `task_ir` canonical object。缺失字段通过 sample weight mask；公共数据可以训练分类头，但没有真实 effort supervision 时不会伪造分钟真值。保存的 artifact 包括 `model.keras` 和 `metadata.json`，推理 JSON 在保留旧 scalar 字段的同时，新增 `predictions` 完整分布、abstention 和 effort bucket candidates，方便 router 使用候选和置信度。旧的 text-only artifact 仍可加载，新训练产物使用模型版本 `0.5.0`。
 
 当前仓库的默认解释器是 Python 3.14。它可以运行清洗、TaskTagger 和 Hugging Face `datasets` 4/5 系列，但仓库固定的 TensorFlow 2.16.2 没有 Python 3.14 wheel。本机真正训练需要单独准备 Python 3.11/3.12 环境，再按硬件安装对应 runtime；这不是代码训练失败，而是运行时 wheel 约束。
 

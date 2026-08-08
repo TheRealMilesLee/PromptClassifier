@@ -265,6 +265,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="multiply trusted manual/gold/seed labels during training so weak public data cannot drown them",
     )
     train.add_argument(
+        "--architecture",
+        choices=("bigru", "transformer-challenger"),
+        default="bigru",
+        help="production BiGRU or optional Transformer challenger with the same output contract",
+    )
+    train.add_argument(
         "--require-gpu",
         action="store_true",
         help="fail instead of silently falling back to CPU when no GPU/Metal/CUDA device is visible",
@@ -354,6 +360,7 @@ def main(argv: list[str] | None = None) -> int:
             seed=args.seed,
             require_gpu=args.require_gpu,
             gold_replay_multiplier=args.gold_replay_multiplier,
+            architecture=args.architecture,
         )
         print(json.dumps(metadata, ensure_ascii=False, indent=2))
         return 0

@@ -18,7 +18,7 @@ from .tf_data import (
     split_records,
 )
 from .tf_inference import TensorFlowTaskModel
-from .tf_model import build_text_model, require_tensorflow
+from .tf_model import build_text_model, build_transformer_challenger, require_tensorflow
 from .tf_features import STRUCTURED_FEATURE_NAMES
 from .tf_runtime import inspect_tensorflow_runtime
 from .task_ast import TaskAST
@@ -34,7 +34,12 @@ def train_model(
     seed: int = 42,
     require_gpu: bool = False,
     gold_replay_multiplier: float = 8.0,
+    architecture: str = "bigru",
 ) -> dict[str, object]:
+    if gold_replay_multiplier < 1.0:
+        raise ValueError("gold_replay_multiplier must be at least 1")
+    if architecture not in {"bigru", "transformer-challenger"}:
+        raise ValueError("architecture must be 'bigru' or 'transformer-challenger'")
     tf = require_tensorflow()
     runtime = inspect_tensorflow_runtime(tf)
     gpu_devices = runtime["gpu_devices"]
@@ -44,8 +49,6 @@ def train_model(
             "install requirements-tensorflow-cuda.txt and verify nvidia-smi, or "
             "rerun without --require-gpu to use CPU fallback"
         )
-    if gold_replay_multiplier < 1.0:
-        raise ValueError("gold_replay_multiplier must be at least 1")
     tf.keras.utils.set_random_seed(seed)
 
     records = load_task_records(data_path)
@@ -92,7 +95,12 @@ def train_model(
         batch_size=batch_size,
         seed=seed,
     )
-    model = build_text_model(
+    model_builder = (
+        build_text_model
+        if architecture == "bigru"
+        else build_transformer_challenger
+    )
+    model = model_builder(
         [record.original_prompt for record in train_records],
         label_maps,
     )
@@ -123,10 +131,33 @@ def train_model(
     evaluation = model.evaluate(validation_dataset, return_dict=True, verbose=0)
     model.save(output_dir / "model.keras")
     warnings = _training_warnings(supervision_counts)
+    architecture_config = {
+        "character_max_tokens": 12_000,
+        "character_sequence_length": 192,
+        "embedding_dim": 96,
+        "ngram_max_tokens": 24_000,
+        "ngram_range": [2, 5],
+        "text_encoder": (
+            {"type": "bigru", "recurrent_units": 64}
+            if architecture == "bigru"
+            else {
+                "type": "transformer",
+                "layers": 2,
+                "attention_heads": 4,
+                "feed_forward_dim": 192,
+            }
+        ),
+    }
     metadata = {
         "model_id": "trendmodel-text-v1",
         "model_version": "0.5.0",
-        "architecture": "TextVectorization(character) + Embedding + BiGRU + character n-gram TF-IDF branch + integrated TaskAST feature branch + multi-task heads (including effort bucket and ordinal effort)",
+        "architecture_family": architecture,
+        "architecture": (
+            "TextVectorization(character) + Embedding + BiGRU + character n-gram TF-IDF branch + integrated TaskAST feature branch + multi-task heads (including effort bucket and ordinal effort)"
+            if architecture == "bigru"
+            else "TextVectorization(character) + positional Embedding + Transformer encoder + character n-gram TF-IDF branch + integrated TaskAST feature branch + multi-task heads (including effort bucket and ordinal effort)"
+        ),
+        "architecture_config": architecture_config,
         "task_ast_schema": TaskAST.schema_version,
         "post_hoc_probability_fusion": False,
         "abstention": {
@@ -661,6 +692,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="multiply trusted manual/gold/seed labels during training so weak public data cannot drown them",
     )
     train.add_argument(
+        "--architecture",
+        choices=("bigru", "transformer-challenger"),
+        default="bigru",
+        help="production BiGRU or optional Transformer challenger with the same output contract",
+    )
+    train.add_argument(
         "--require-gpu",
         action="store_true",
         help="fail instead of silently falling back to CPU when no GPU/Metal/CUDA device is visible",
@@ -710,6 +747,7 @@ def main(argv: list[str] | None = None) -> int:
             seed=args.seed,
             require_gpu=args.require_gpu,
             gold_replay_multiplier=args.gold_replay_multiplier,
+            architecture=args.architecture,
         )
         print(json.dumps(metadata, ensure_ascii=False, indent=2))
         return 0
