@@ -9,6 +9,7 @@ from trendmodel.tf_inference import (
     TensorFlowTaskModel,
     _classification_payload,
     _effort_payload_from_raw,
+    _ordinal_to_bucket_distribution,
 )
 
 
@@ -180,6 +181,31 @@ class TensorFlowInferenceContractTest(unittest.TestCase):
         self.assertEqual(payload["basis"], "trained_observed_effort_and_bucket_heads")
         self.assertEqual(payload["label"], "L")
         self.assertEqual(payload["estimated_minutes"], 300)
+
+    def test_ordinal_effort_head_is_preferred_and_monotonic(self) -> None:
+        distribution = _ordinal_to_bucket_distribution([0.9, 0.7, 0.8, 0.2])
+        self.assertEqual(len(distribution), 5)
+        self.assertAlmostEqual(sum(distribution), 1.0, places=6)
+        self.assertTrue(all(value >= 0.0 for value in distribution))
+
+        payload = _effort_payload_from_raw(
+            {
+                "effort_ordinal": [[0.8, 0.45, 0.3, 0.1]],
+                "effort_log_minutes": [[math.log1p(300.0)]],
+            },
+            [0.1, 0.2, 0.7],
+            {
+                "effort_bucket_supervision_samples": 80,
+                "effort_ordinal_supervision_samples": 80,
+                "effort_supervision_samples": 25,
+                "observed_effort_samples": 25,
+            },
+            effort_bucket_labels=["XS", "S", "M", "L", "XL"],
+        )
+
+        self.assertEqual(payload["basis"], "trained_observed_effort_and_ordinal_heads")
+        self.assertEqual(payload["label"], "S")
+        self.assertEqual(len(payload["candidates"]), 3)
 
     def test_classification_payload_exposes_uncertainty_diagnostics(self) -> None:
         payload = _classification_payload(

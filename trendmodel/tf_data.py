@@ -467,11 +467,16 @@ def make_dataset(
         "effort_bucket",
         effort_bucket_index,
     )
+    effort_ordinal_values = [
+        _effort_ordinal_target(record.effort_bucket, effort_bucket_index)
+        for record in records
+    ]
     targets = {
         "workload_type": workload_values,
         "intent": intent_values,
         "complexity": complexity_values,
         "effort_bucket": effort_bucket_values,
+        "effort_ordinal": effort_ordinal_values,
         "effort_log_minutes": [
             math.log1p(record.effort_minutes) if record.effort_minutes is not None else 0.0
             for record in records
@@ -486,6 +491,9 @@ def make_dataset(
         "intent": intent_masks,
         "complexity": complexity_masks,
         "effort_bucket": effort_bucket_masks,
+        # The ordinal head has the same supervision boundary as the coarse
+        # bucket head: every threshold is observed when the bucket is known.
+        "effort_ordinal": effort_bucket_masks,
         "effort_log_minutes": [
             replay_supervision_weight(
                 record,
@@ -511,6 +519,21 @@ def make_dataset(
     if shuffle:
         dataset = dataset.shuffle(max(len(records), 1), seed=seed, reshuffle_each_iteration=True)
     return dataset.batch(batch_size).prefetch(tf.data.AUTOTUNE)
+
+
+def _effort_ordinal_target(
+    bucket: str | None,
+    bucket_index: Mapping[str, int],
+) -> list[float]:
+    """Encode ``P(Y > XS)`` ... ``P(Y > L)`` targets for one bucket label."""
+
+    if bucket is None:
+        return [0.0] * (len(bucket_index) - 1)
+    try:
+        index = bucket_index[bucket]
+    except KeyError as error:
+        raise ValueError(f"effort bucket {bucket!r} is not present in label maps") from error
+    return [1.0 if index > threshold else 0.0 for threshold in range(len(bucket_index) - 1)]
 
 
 def replay_supervision_weight(

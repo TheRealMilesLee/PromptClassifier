@@ -10,6 +10,7 @@ from trendmodel.tf_data import (
     load_task_records,
     split_records,
     replay_supervision_weight,
+    _effort_ordinal_target,
 )
 
 
@@ -97,6 +98,13 @@ class TensorFlowDataTest(unittest.TestCase):
         self.assertTrue(record.effort_bucket_supervised)
         self.assertTrue(record.effort_minutes_supervised)
         self.assertEqual(record.supervision_weight("effort_log_minutes"), 1.0)
+
+    def test_effort_ordinal_targets_preserve_bucket_order(self) -> None:
+        index = {label: position for position, label in enumerate(("XS", "S", "M", "L", "XL"))}
+        self.assertEqual(_effort_ordinal_target("XS", index), [0.0, 0.0, 0.0, 0.0])
+        self.assertEqual(_effort_ordinal_target("M", index), [1.0, 1.0, 0.0, 0.0])
+        self.assertEqual(_effort_ordinal_target("XL", index), [1.0, 1.0, 1.0, 1.0])
+        self.assertEqual(_effort_ordinal_target(None, index), [0.0, 0.0, 0.0, 0.0])
 
 
 if __name__ == "__main__":

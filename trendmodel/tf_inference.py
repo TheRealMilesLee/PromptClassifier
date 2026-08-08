@@ -272,6 +272,9 @@ def _raw_batch_row(raw: Any, index: int) -> dict[str, Any]:
     ]
     if isinstance(raw, dict) and "effort_bucket" in raw:
         names.insert(3, "effort_bucket")
+    if isinstance(raw, dict) and "effort_ordinal" in raw:
+        ordinal_index = names.index("effort_log_minutes")
+        names.insert(ordinal_index, "effort_ordinal")
     for name in names:
         value = raw[name] if isinstance(raw, dict) else raw
         if hasattr(value, "numpy"):
@@ -479,8 +482,13 @@ def _effort_payload_from_raw(
     """
 
     has_bucket_head = "effort_bucket" in raw
+    has_ordinal_head = "effort_ordinal" in raw
     effort_available = _effort_head_is_supervised(metadata)
-    if not effort_available and not has_bucket_head:
+    if not effort_available and (
+        has_bucket_head
+        or has_ordinal_head
+        or "effort_bucket_supervision_samples" in metadata
+    ):
         return {
             "label": "unknown",
             "probability": 0.0,
@@ -494,7 +502,17 @@ def _effort_payload_from_raw(
         }
 
     bucket_probabilities: list[float]
-    if has_bucket_head:
+    if has_ordinal_head:
+        ordinal_probabilities = _probabilities(raw, "effort_ordinal")
+        bucket_probabilities = _ordinal_to_bucket_distribution(ordinal_probabilities)
+        effort_bucket = effort_bucket_labels[_argmax(bucket_probabilities)]
+        bucket_probability = max(bucket_probabilities)
+        bucket_candidates = _classification_payload(
+            effort_bucket,
+            bucket_probabilities,
+            effort_bucket_labels,
+        )
+    elif has_bucket_head:
         bucket_probabilities = _probabilities(raw, "effort_bucket")
         effort_bucket = effort_bucket_labels[_argmax(bucket_probabilities)]
         bucket_probability = max(bucket_probabilities)
@@ -539,7 +557,9 @@ def _effort_payload_from_raw(
             ),
         )
         effort_basis = (
-            "trained_observed_effort_and_bucket_heads"
+            "trained_observed_effort_and_ordinal_heads"
+            if has_ordinal_head
+            else "trained_observed_effort_and_bucket_heads"
             if has_bucket_head
             else "trained_observed_effort_head"
         )
@@ -557,7 +577,13 @@ def _effort_payload_from_raw(
                 else 0.15 + 0.35 * bucket_probability,
             ),
         )
-        effort_basis = "trained_effort_bucket_head" if has_bucket_head else "bucket_seed_only"
+        effort_basis = (
+            "trained_effort_ordinal_head"
+            if has_ordinal_head
+            else "trained_effort_bucket_head"
+            if has_bucket_head
+            else "bucket_seed_only"
+        )
 
     return {
         "label": effort_bucket,
@@ -570,6 +596,33 @@ def _effort_payload_from_raw(
         "confidence": round(effort_confidence, 4),
         "basis": effort_basis,
     }
+
+
+def _ordinal_to_bucket_distribution(probabilities: list[float]) -> list[float]:
+    """Convert monotone ordinal thresholds into a five-bucket distribution."""
+
+    if len(probabilities) != len(EFFORT_BUCKET_ORDER) - 1:
+        raise ValueError(
+            "effort ordinal head must provide one threshold for each adjacent bucket pair"
+        )
+    # Independent sigmoid outputs can violate ordinal ordering.  A small
+    # cumulative projection keeps the derived distribution non-negative while
+    # retaining the model's strongest threshold evidence.
+    thresholds: list[float] = []
+    for value in probabilities:
+        bounded = max(0.0, min(1.0, float(value)))
+        thresholds.append(min(bounded, thresholds[-1]) if thresholds else bounded)
+    buckets = [1.0 - thresholds[0]]
+    buckets.extend(
+        thresholds[index] - thresholds[index + 1]
+        for index in range(len(thresholds) - 1)
+    )
+    buckets.append(thresholds[-1])
+    buckets = [max(0.0, value) for value in buckets]
+    total = sum(buckets)
+    if total <= 0.0:
+        return [1.0 / len(EFFORT_BUCKET_ORDER)] * len(EFFORT_BUCKET_ORDER)
+    return [value / total for value in buckets]
 
 
 def _effort_head_is_supervised(metadata: dict[str, Any]) -> bool:

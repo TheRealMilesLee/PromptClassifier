@@ -19,4 +19,4 @@ __all__ = [
     "TaskTagger",
     "TrainingExample",
 ]
-__version__ = "0.3.0"
+__version__ = "0.4.0"

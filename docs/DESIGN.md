@@ -1,6 +1,6 @@
 # TrendModel：面向 Auto Router 的轻量级任务分析模型
 
-> 论文式系统设计文档；实现基线：`model_version = 0.3.0`
+> 论文式系统设计文档；实现基线：`model_version = 0.4.0`
 
 ## 摘要
 
@@ -101,6 +101,7 @@ workload_type       ∈ {text, code, analysis, operations, planning, mixed, othe
 intent              ∈ {create, modify, debug, explain, execute, ...}
 complexity          ∈ {low, medium, high}
 effort_bucket       ∈ {XS, S, M, L, XL}
+effort_ordinal      ∈ {P(Y > XS), P(Y > S), P(Y > M), P(Y > L)}
 needs_clarification ∈ {false, true}
 ```
 
@@ -874,8 +875,9 @@ flowchart LR
     M --> O["intent"]
     M --> P["complexity"]
     M --> Q["effort_bucket"]
-    M --> R["effort_log_minutes"]
-    M --> S["needs_clarification"]
+    M --> R["effort_ordinal"]
+    M --> S["effort_log_minutes"]
+    M --> T["needs_clarification"]
 ```
 
 ### 6.1 字符级文本分支
@@ -927,6 +929,7 @@ flowchart LR
 | `intent` | 多分类概率 | Sparse Categorical Cross Entropy |
 | `complexity` | 多分类概率 | Sparse Categorical Cross Entropy |
 | `effort_bucket` | 多分类概率 | Sparse Categorical Cross Entropy |
+| `effort_ordinal` | 四个顺序阈值概率 `P(Y > XS)` … `P(Y > L)` | Binary Cross Entropy |
 | `effort_log_minutes` | `log1p(minutes)` 回归值 | Huber Loss |
 | `needs_clarification` | 0–1 概率 | Binary Cross Entropy |
 
@@ -938,6 +941,7 @@ L_total =
   + 1.0 × L_intent
   + 0.8 × L_complexity
   + 0.8 × L_effort_bucket
+  + 0.8 × L_effort_ordinal
   + 1.0 × L_effort_log_minutes
   + 0.7 × L_needs_clarification
 ```
@@ -992,7 +996,9 @@ y_effort = log1p(active_minutes)
 | Basis | 含义 |
 | --- | --- |
 | `trained_effort_bucket_head` | 有 bucket head，但没有真实分钟监督 |
+| `trained_effort_ordinal_head` | 使用 ordinal effort head，但没有真实分钟监督 |
 | `trained_observed_effort_and_bucket_heads` | 同时有真实分钟和 bucket 监督 |
+| `trained_observed_effort_and_ordinal_heads` | 同时有真实分钟和 ordinal bucket 监督 |
 | `trained_observed_effort_head` | 旧 artifact 的分钟回归模型 |
 | `bucket_seed_only` | 旧 text-only artifact 的 bucket fallback |
 | `no_effort_supervision` | 没有可用 effort supervision |
@@ -1426,7 +1432,7 @@ effective_weight(field, record)
   × gold_replay_multiplier(if trusted gold/seed/observed)
 ```
 
-这是训练策略的概念表达；实际代码对 `effort_bucket` 和 `effort_log_minutes` 使用独立的监督 mask，bucket-only 记录不会进入分钟回归，不能简单套用普通分类 head 的 confidence 权重。weak/pseudo 标签只作为覆盖和表示学习信号；人工 gold 和真实 observed effort 才是最终质量判断的依据。当前默认 `gold_replay_multiplier=8`，只作用于训练 sample weight，不复制数据行，也不作用于 validation。
+这是训练策略的概念表达；实际代码对 `effort_bucket`/`effort_ordinal` 和 `effort_log_minutes` 使用独立的监督 mask，bucket-only 记录不会进入分钟回归，不能简单套用普通分类 head 的 confidence 权重。weak/pseudo 标签只作为覆盖和表示学习信号；人工 gold 和真实 observed effort 才是最终质量判断的依据。当前默认 `gold_replay_multiplier=8`，只作用于训练 sample weight，不复制数据行，也不作用于 validation。
 
 ## 21. 训练流程与优化目标
 
@@ -1479,23 +1485,24 @@ flowchart LR
 ```text
 L_total =
     1.0 × L_workload
-  + 1.0 × L_intent
-  + 0.8 × L_complexity
-  + 0.8 × L_effort_bucket
-  + 1.0 × L_effort_log_minutes
-  + 0.7 × L_needs_clarification
+    + 1.0 × L_intent
+    + 0.8 × L_complexity
+    + 0.8 × L_effort_bucket
+    + 0.8 × L_effort_ordinal
+    + 1.0 × L_effort_log_minutes
+    + 0.7 × L_needs_clarification
 ```
 
-其中四个分类 head 使用 sparse categorical cross-entropy，`effort_log_minutes` 使用 Huber loss，`needs_clarification` 使用 binary cross-entropy。缺失的标签对应 sample weight 为 0，因此公共 prompt 可以训练 workload/intent 等字段，而不会因为没有 `active_minutes` 被强行填充成伪真值（实现见 [`trendmodel/tf_data.py`](../trendmodel/tf_data.py) 和 [`trendmodel/tf_train.py`](../trendmodel/tf_train.py)）。
+其中 workload、intent、complexity 和 `effort_bucket` 使用 sparse categorical cross-entropy，`effort_ordinal` 和 `needs_clarification` 使用 binary cross-entropy，`effort_log_minutes` 使用 Huber loss。缺失的标签对应 sample weight 为 0，因此公共 prompt 可以训练 workload/intent 等字段，而不会因为没有 `active_minutes` 被强行填充成伪真值（实现见 [`trendmodel/tf_data.py`](../trendmodel/tf_data.py) 和 [`trendmodel/tf_train.py`](../trendmodel/tf_train.py)）。
 
-`effort_bucket` 和 `effort_log_minutes` 是两个不同监督目标：
+`effort_bucket`、`effort_ordinal` 和 `effort_log_minutes` 是三个不同监督目标：
 
 ```text
 bucket-only record:
-    trains effort_bucket only
+    trains effort_bucket + ordinal effort only
 
 record with observed active_minutes:
-    trains effort_bucket + log1p(active_minutes) regression
+    trains effort_bucket + ordinal effort + log1p(active_minutes) regression
 ```
 
 训练结束后保存 `model.keras` 和 `metadata.json`。metadata 记录 labels、feature schema、runtime、数据来源分布、supervision counts、validation metrics、warnings 和 artifact round-trip metrics。

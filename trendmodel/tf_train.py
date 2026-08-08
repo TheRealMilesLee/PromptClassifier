@@ -124,8 +124,8 @@ def train_model(
     warnings = _training_warnings(supervision_counts)
     metadata = {
         "model_id": "trendmodel-text-v1",
-        "model_version": "0.3.0",
-        "architecture": "TextVectorization(character) + Embedding + BiGRU + character n-gram TF-IDF branch + integrated TaskAST feature branch + multi-task heads (including effort bucket)",
+        "model_version": "0.4.0",
+        "architecture": "TextVectorization(character) + Embedding + BiGRU + character n-gram TF-IDF branch + integrated TaskAST feature branch + multi-task heads (including effort bucket and ordinal effort)",
         "task_ast_schema": TaskAST.schema_version,
         "post_hoc_probability_fusion": False,
         "text_encoder": {
@@ -149,6 +149,7 @@ def train_model(
         ),
         "observed_effort_samples": supervision_counts["observed_effort"],
         "effort_bucket_supervision_samples": supervision_counts["effort_bucket"],
+        "effort_ordinal_supervision_samples": supervision_counts["effort_bucket"],
         "effort_supervision_samples": supervision_counts["effort"],
         "effort_minutes_supervision_samples": supervision_counts["effort_minutes"],
         "label_source_counts": dict(Counter(record.label_source for record in records)),
