@@ -1089,7 +1089,7 @@ flowchart LR
   → 全部 train 或全部 validation
 ```
 
-没有 `split_group` 时，loader 会把每条记录当作独立 group；这在效果上等同于 record-level deterministic split，但仍然保持同一套切分逻辑。
+没有 `split_group` 时，loader 会把每条记录当作独立 group；这在效果上等同于 record-level deterministic split，但仍然保持同一套切分逻辑。有 group 时，loader 先按 workload、intent、complexity 和 effort 的 dominant label 构造 strata，再按最大余数法分配 validation quota，最后以 group 为不可拆分单位选取样本。这样不会让同一 conversation/session 跨边界，同时尽量保持各个监督 head 的 holdout 分布；当某个稀有标签只存在于一个不可拆分 group 时，仍可能因为泄漏约束而无法同时出现在两侧。
 
 ## 12. 推理阶段的 TaskAST 输入与 evidence 输出
 

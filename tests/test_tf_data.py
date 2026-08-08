@@ -40,6 +40,37 @@ class TensorFlowDataTest(unittest.TestCase):
         self.assertEqual(first_train, second_train)
         self.assertEqual(first_validation, second_validation)
 
+    def test_group_split_is_approximately_stratified_without_leakage(self) -> None:
+        records = []
+        for workload in ("text", "code"):
+            for group_index in range(5):
+                for turn in range(2):
+                    records.append(
+                        TaskRecord.from_mapping(
+                            {
+                                "original_prompt": f"{workload} request {group_index}-{turn}",
+                                "workload_type": workload,
+                                "intent": "explain" if workload == "text" else "create",
+                                "complexity": "low" if workload == "text" else "high",
+                                "effort_bucket": "S" if workload == "text" else "L",
+                                "split_group": f"{workload}-{group_index}",
+                                "label_source": "manual_gold",
+                            }
+                        )
+                    )
+
+        training, validation = split_records(records, validation_ratio=0.2, seed=17)
+
+        self.assertEqual(len(validation), 4)
+        self.assertEqual(
+            {record.split_group for record in training} & {record.split_group for record in validation},
+            set(),
+        )
+        self.assertEqual(
+            {record.workload_type for record in validation},
+            {"text", "code"},
+        )
+
     def test_balance_weights_raise_rare_supervised_labels_without_exploding(self) -> None:
         maps = build_label_maps(self.records)
         weights = label_balance_weights(self.records, maps)

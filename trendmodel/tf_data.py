@@ -378,18 +378,101 @@ def split_records(
 
     group_keys = list(groups)
     random.Random(seed).shuffle(group_keys)
+    random_priority = {key: index for index, key in enumerate(group_keys)}
     validation_size = max(1, round(len(records) * validation_ratio))
-    validation_keys: list[str] = []
-    validation_count = 0
+    stratification_fields = ("workload_type", "intent", "complexity", "effort_bucket")
+
+    # Group signatures let us stratify in one pass over the corpus instead of
+    # repeatedly scanning every remaining conversation.  A signature uses the
+    # dominant observed label for each field; mixed-label conversations remain
+    # in one group and therefore never leak across the split.
+    signature_buckets: dict[tuple[str, ...], list[str]] = {}
     for key in group_keys:
-        if validation_count >= validation_size:
+        signature = tuple(
+            _dominant_group_label(groups[key], field)
+            for field in stratification_fields
+        )
+        signature_buckets.setdefault(signature, []).append(key)
+
+    bucket_totals = {
+        signature: sum(len(groups[key]) for key in keys)
+        for signature, keys in signature_buckets.items()
+    }
+    bucket_targets = {
+        signature: min(
+            total,
+            int(total * validation_ratio),
+        )
+        for signature, total in bucket_totals.items()
+    }
+    remaining_quota = validation_size - sum(bucket_targets.values())
+    # Largest remainders recover the requested global validation size while
+    # giving small/rare strata a deterministic chance to enter the holdout.
+    remainder_order = sorted(
+        bucket_totals,
+        key=lambda signature: (
+            -(bucket_totals[signature] * validation_ratio - bucket_targets[signature]),
+            signature,
+        ),
+    )
+    for signature in remainder_order:
+        if remaining_quota <= 0:
             break
-        # Keep at least one group in training even when the requested ratio is
-        # very high and a single group is large.
-        if len(validation_keys) == len(group_keys) - 1:
-            break
-        validation_keys.append(key)
-        validation_count += len(groups[key])
+        if bucket_targets[signature] < bucket_totals[signature]:
+            bucket_targets[signature] += 1
+            remaining_quota -= 1
+
+    validation_keys = []
+    validation_count = 0
+    for signature in sorted(signature_buckets):
+        keys = sorted(signature_buckets[signature], key=random_priority.__getitem__)
+        target = bucket_targets[signature]
+        bucket_count = 0
+        for key in keys:
+            if bucket_count >= target:
+                break
+            validation_keys.append(key)
+            bucket_count += len(groups[key])
+            validation_count += len(groups[key])
+
+    selected = set(validation_keys)
+    if validation_count < validation_size:
+        candidates = sorted(
+            (key for key in group_keys if key not in selected),
+            key=lambda key: (
+                abs(validation_count + len(groups[key]) - validation_size),
+                random_priority[key],
+            ),
+        )
+        for key in candidates:
+            if validation_count >= validation_size or len(selected) >= len(group_keys) - 1:
+                break
+            validation_keys.append(key)
+            selected.add(key)
+            validation_count += len(groups[key])
+    elif validation_count > validation_size and len(validation_keys) > 1:
+        candidates = sorted(
+            validation_keys,
+            key=lambda key: (
+                abs(validation_count - len(groups[key]) - validation_size),
+                -len(groups[key]),
+                random_priority[key],
+            ),
+        )
+        for key in candidates:
+            if validation_count <= validation_size or len(validation_keys) <= 1:
+                break
+            validation_keys.remove(key)
+            selected.remove(key)
+            validation_count -= len(groups[key])
+
+    # The ratio may be smaller than one indivisible group.  Preserve a valid
+    # non-empty holdout and always leave at least one group in training.
+    if not validation_keys:
+        validation_keys.append(min(group_keys, key=lambda key: (len(groups[key]), random_priority[key])))
+    if len(validation_keys) == len(group_keys):
+        selected_key = max(validation_keys, key=lambda key: (len(groups[key]), random_priority[key]))
+        validation_keys.remove(selected_key)
 
     validation_set = set(validation_keys)
     validation = [record for key in validation_keys for record in groups[key]]
@@ -397,6 +480,27 @@ def split_records(
     if not training or not validation:
         raise ValueError("unable to create non-empty conversation-level train/validation split")
     return training, validation
+
+
+def _observed_label_counts(records: Iterable[TaskRecord], field: str) -> dict[str, int]:
+    """Count one supervised label field without turning missing labels into a class."""
+
+    counts: dict[str, int] = {}
+    for record in records:
+        label = getattr(record, field)
+        if label is not None:
+            key = str(label)
+            counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
+def _dominant_group_label(records: Iterable[TaskRecord], field: str) -> str:
+    """Return a stable representative label for one group/signature field."""
+
+    counts = _observed_label_counts(records, field)
+    if not counts:
+        return ""
+    return min(counts, key=lambda label: (-counts[label], label))
 
 
 def make_dataset(
